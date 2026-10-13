@@ -1,4 +1,4 @@
-const DEFAULT_API_BASE = "http://13.201.18.212:8000";
+const DEFAULT_API_BASE = "http://15.206.230.236:8000";
 
 const state = {
   apiBase: localStorage.getItem("apiBase") || DEFAULT_API_BASE,
