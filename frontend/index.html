@@ -1,0 +1,267 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Job Application Agent</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <h1>Job Application Agent</h1>
+    <div class="account-bar">
+      <input id="apiBaseInput" type="text" placeholder="API base URL" />
+      <span id="userBadge" class="user-badge hidden"></span>
+    </div>
+  </header>
+
+  <main>
+    <section id="authSection" class="card">
+      <h2>Get started</h2>
+      <div class="tabs small-tabs">
+        <button class="tab-btn active" data-tab="loginTab">I have an account</button>
+        <button class="tab-btn" data-tab="createTab">Create account</button>
+      </div>
+
+      <div id="loginTab" class="tab-pane active">
+        <label>Your email</label>
+        <input id="loginEmail" type="email" placeholder="you@example.com" />
+        <button id="loginBtn">Continue</button>
+      </div>
+
+      <div id="createTab" class="tab-pane">
+        <label>Full name</label>
+        <input id="newFullName" type="text" placeholder="Jane Doe" />
+        <label>Email</label>
+        <input id="newEmail" type="email" placeholder="you@example.com" />
+        <label>Phone</label>
+        <input id="newPhone" type="text" placeholder="+1 555 555 5555" />
+        <label>Years of experience</label>
+        <input id="newYears" type="number" step="0.5" placeholder="3" />
+        <button id="createUserBtn">Create account</button>
+      </div>
+
+      <p id="authMsg" class="msg"></p>
+    </section>
+
+    <section id="dashboard" class="hidden">
+      <div class="tabs">
+        <button class="tab-btn active" data-tab="profileTab">Profile</button>
+        <button class="tab-btn" data-tab="resumesTab">Resumes</button>
+        <button class="tab-btn" data-tab="workTab">Work History</button>
+        <button class="tab-btn" data-tab="eduTab">Education</button>
+        <button class="tab-btn" data-tab="docsTab">Documents</button>
+        <button class="tab-btn" data-tab="rolesTab">Target Roles</button>
+        <button class="tab-btn" data-tab="appsTab">Applications</button>
+        <button class="tab-btn" data-tab="postingsTab">Job Postings</button>
+        <button class="tab-btn" data-tab="sourcesTab">Job Sources</button>
+      </div>
+
+      <!-- Profile -->
+      <div id="profileTab" class="tab-pane active card">
+        <h2>Candidate Profile</h2>
+        <div class="grid2">
+          <div><label>Address line 1</label><input id="p_address_line1" /></div>
+          <div><label>Address line 2</label><input id="p_address_line2" /></div>
+          <div><label>City</label><input id="p_city" /></div>
+          <div><label>State</label><input id="p_state" /></div>
+          <div><label>Postal code</label><input id="p_postal_code" /></div>
+          <div><label>Country</label><input id="p_country" /></div>
+          <div><label>LinkedIn URL</label><input id="p_linkedin_url" /></div>
+          <div><label>Portfolio URL</label><input id="p_portfolio_url" /></div>
+          <div><label>GitHub URL</label><input id="p_github_url" /></div>
+          <div><label>Work authorization</label><input id="p_work_authorization" placeholder="e.g. US Citizen" /></div>
+          <div class="checkbox-row"><label><input type="checkbox" id="p_requires_sponsorship" /> Requires sponsorship</label></div>
+          <div class="checkbox-row"><label><input type="checkbox" id="p_willing_to_relocate" /> Willing to relocate</label></div>
+          <div>
+            <label>Gender</label>
+            <select id="p_gender">
+              <option value="">Decline to self identify</option>
+              <option value="male">Male</option>
+              <option value="female">Female</option>
+              <option value="non_binary">Non-binary</option>
+            </select>
+          </div>
+          <div>
+            <label>Race / ethnicity</label>
+            <select id="p_race_ethnicity">
+              <option value="">Decline to self identify</option>
+              <option value="hispanic_or_latino">Hispanic or Latino</option>
+              <option value="white">White (Not Hispanic or Latino)</option>
+              <option value="black_or_african_american">Black or African American (Not Hispanic or Latino)</option>
+              <option value="native_hawaiian_or_pacific_islander">Native Hawaiian or Other Pacific Islander (Not Hispanic or Latino)</option>
+              <option value="asian">Asian (Not Hispanic or Latino)</option>
+              <option value="american_indian_or_alaska_native">American Indian or Alaska Native (Not Hispanic or Latino)</option>
+              <option value="two_or_more_races">Two or More Races (Not Hispanic or Latino)</option>
+            </select>
+          </div>
+          <div>
+            <label>Veteran status</label>
+            <select id="p_veteran_status">
+              <option value="">I don't wish to answer</option>
+              <option value="not_protected_veteran">I am not a protected veteran</option>
+              <option value="protected_veteran">I identify as one or more of the classifications of a protected veteran</option>
+              <option value="decline_classification">I am a protected veteran, but I choose not to self-identify the classifications to which I belong</option>
+            </select>
+          </div>
+          <div>
+            <label>Disability status</label>
+            <select id="p_disability_status">
+              <option value="">I do not want to answer</option>
+              <option value="yes_disability">Yes, I have (or previously had) a disability</option>
+              <option value="no_disability">No, I do not have a disability</option>
+            </select>
+          </div>
+          <div><label>Expected salary (min)</label><input id="p_expected_salary_min" type="number" /></div>
+          <div><label>Expected salary (max)</label><input id="p_expected_salary_max" type="number" /></div>
+          <div><label>Notice period (days)</label><input id="p_notice_period_days" type="number" /></div>
+        </div>
+        <button id="saveProfileBtn">Save profile</button>
+        <p id="profileMsg" class="msg"></p>
+      </div>
+
+      <!-- Resumes -->
+      <div id="resumesTab" class="tab-pane card hidden">
+        <h2>Resumes</h2>
+        <div class="upload-row">
+          <input id="resumeLabel" type="text" placeholder="Label, e.g. Backend - Python focus" />
+          <input id="resumeFile" type="file" accept=".pdf,.doc,.docx,.txt" />
+          <button id="uploadResumeBtn">Upload resume</button>
+        </div>
+        <button id="cancelResumeEditBtn" class="secondary hidden">Cancel edit</button>
+        <p id="resumeMsg" class="msg"></p>
+        <div id="resumeList" class="list"></div>
+      </div>
+
+      <!-- Work History -->
+      <div id="workTab" class="tab-pane card hidden">
+        <h2>Work Experience</h2>
+        <div class="grid2">
+          <div><label>Company</label><input id="w_company" /></div>
+          <div><label>Title</label><input id="w_title" /></div>
+          <div><label>Location</label><input id="w_location" /></div>
+          <div><label>Start date</label><input id="w_start_date" type="date" /></div>
+          <div><label>End date</label><input id="w_end_date" type="date" /></div>
+          <div class="checkbox-row"><label><input type="checkbox" id="w_is_current" /> I currently work here</label></div>
+        </div>
+        <label>Description</label>
+        <textarea id="w_description" rows="3"></textarea>
+        <button id="addWorkBtn">Add work experience</button>
+        <button id="cancelWorkEditBtn" class="secondary hidden">Cancel edit</button>
+        <p id="workMsg" class="msg"></p>
+        <div id="workList" class="list"></div>
+      </div>
+
+      <!-- Education -->
+      <div id="eduTab" class="tab-pane card hidden">
+        <h2>Education</h2>
+        <div class="grid2">
+          <div><label>School</label><input id="e_school" /></div>
+          <div><label>Degree</label><input id="e_degree" /></div>
+          <div><label>Field of study</label><input id="e_field_of_study" /></div>
+          <div><label>Start date</label><input id="e_start_date" type="date" /></div>
+          <div><label>End date</label><input id="e_end_date" type="date" /></div>
+          <div><label>GPA</label><input id="e_gpa" type="number" step="0.01" /></div>
+        </div>
+        <button id="addEduBtn">Add education</button>
+        <button id="cancelEduEditBtn" class="secondary hidden">Cancel edit</button>
+        <p id="eduMsg" class="msg"></p>
+        <div id="eduList" class="list"></div>
+      </div>
+
+      <!-- Documents -->
+      <div id="docsTab" class="tab-pane card hidden">
+        <h2>Supporting Documents</h2>
+        <div class="upload-row">
+          <input id="docType" type="text" placeholder="Type, e.g. transcript, cover_letter, visa_proof" />
+          <input id="docFile" type="file" />
+          <button id="uploadDocBtn">Upload document</button>
+        </div>
+        <button id="cancelDocEditBtn" class="secondary hidden">Cancel edit</button>
+        <p id="docMsg" class="msg"></p>
+        <div id="docList" class="list"></div>
+      </div>
+
+      <!-- Target Roles -->
+      <div id="rolesTab" class="tab-pane card hidden">
+        <h2>Target Roles</h2>
+        <div class="grid2">
+          <div><label>Title</label><input id="r_title" placeholder="e.g. Backend Engineer" /></div>
+          <div><label>Years of experience</label><input id="r_years" type="number" step="0.5" /></div>
+          <div><label>Keywords (comma separated)</label><input id="r_keywords" placeholder="python, fastapi, aws" /></div>
+        </div>
+        <button id="addRoleBtn">Add target role</button>
+        <button id="cancelRoleEditBtn" class="secondary hidden">Cancel edit</button>
+        <p id="roleMsg" class="msg"></p>
+        <div id="roleList" class="list"></div>
+      </div>
+
+      <!-- Applications -->
+      <div id="appsTab" class="tab-pane card hidden">
+        <h2>Applications</h2>
+        <p class="meta">Auto-matched and pre-filled every 6 hours. Review the filled answers and screenshot, submit it yourself on the job site, then mark it as submitted here.</p>
+        <div class="list-item" style="margin-bottom:14px;">
+          <div>
+            <div class="title">Autofill via browser extension</div>
+            <div class="meta">
+              One-time setup: open <code>chrome://extensions</code>, enable "Developer mode" (top right),
+              click "Load unpacked", and select the <code>extension/</code> folder from the project.
+              Then, on any real job application page (even ones with an embedded iframe form, like Greenhouse),
+              click the extension's icon in your toolbar and hit "Autofill this page" - it reads the application ID
+              from the page URL (opened from an email link) and fills the form directly, including inside iframes.
+              (The earlier bookmarklet approach doesn't work for iframe-embedded forms - browsers block that at
+              the JavaScript level; the extension can reach inside because it's injected per-frame by the browser itself.)
+            </div>
+          </div>
+        </div>
+        <button id="refreshAppsBtn" class="secondary">Refresh</button>
+        <button id="retryFailedBtn" class="secondary">Retry all failed</button>
+        <p id="appsMsg" class="msg"></p>
+        <div id="appsList" class="list"></div>
+      </div>
+
+      <!-- Job Postings -->
+      <div id="postingsTab" class="tab-pane card hidden">
+        <h2>Discovered Job Postings</h2>
+        <div class="upload-row">
+          <input id="postingCompanyFilter" type="text" placeholder="Filter by company" />
+          <input id="postingTitleFilter" type="text" placeholder="Filter by title" />
+          <button id="postingSearchBtn">Search</button>
+        </div>
+        <p id="postingsMsg" class="msg"></p>
+        <div id="postingsList" class="list"></div>
+        <div class="upload-row" style="margin-top:14px;">
+          <button id="postingsPrevBtn" class="secondary">&larr; Previous</button>
+          <span id="postingsPageInfo" class="meta" style="align-self:center;"></span>
+          <button id="postingsNextBtn" class="secondary">Next &rarr;</button>
+        </div>
+      </div>
+
+      <!-- Job Sources -->
+      <div id="sourcesTab" class="tab-pane card hidden">
+        <h2>Companies to Poll for Job Postings</h2>
+        <p class="meta">This is where you tell the job-discovery cycle which companies' career pages to check every 6 hours.</p>
+        <div class="grid2">
+          <div><label>Company name</label><input id="src_company_name" placeholder="e.g. Stripe" /></div>
+          <div>
+            <label>Platform</label>
+            <select id="src_platform">
+              <option value="greenhouse">Greenhouse</option>
+              <option value="lever">Lever</option>
+              <option value="smartrecruiters">SmartRecruiters</option>
+            </select>
+          </div>
+          <div><label>Slug (the company identifier the platform's API expects)</label><input id="src_slug" placeholder="e.g. stripe" /></div>
+        </div>
+        <button id="addSourceBtn">Add company</button>
+        <button id="discoverAllBtn" class="secondary">Poll all companies now</button>
+        <p id="sourcesMsg" class="msg"></p>
+        <div id="sourcesList" class="list"></div>
+      </div>
+    </section>
+  </main>
+</div>
+<script src="app.js"></script>
+</body>
+</html>
