@@ -1,0 +1,20 @@
+.env
+backend/venv/
+__pycache__/
+*.pyc
+storage/resumes/*
+storage/documents/*
+storage/screenshots/*
+!storage/resumes/.gitkeep
+!storage/documents/.gitkeep
+!storage/screenshots/.gitkeep
+
+# Secrets - never commit
+*.pem
+*.key
+
+# Logs
+*.log
+
+# Editor/tool-local
+.claude/

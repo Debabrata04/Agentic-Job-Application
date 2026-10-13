@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Job Agent Autofill",
+  "version": "1.0.0",
+  "description": "Fills real job application pages (including cross-origin embedded forms like Greenhouse) using data pre-filled by the Job Agent backend.",
+  "permissions": ["activeTab", "webNavigation"],
+  "host_permissions": ["http://localhost:8000/*", "<all_urls>"],
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "all_frames": true,
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+from app.models.models import (  # noqa: F401
+    Application,
+    ApplicationStatus,
+    CandidateProfile,
+    Document,
+    Education,
+    JobPosting,
+    JobSource,
+    Notification,
+    NotificationChannel,
+    Resume,
+    TargetRole,
+    User,
+    WorkExperience,
+)

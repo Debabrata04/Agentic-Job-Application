@@ -1,0 +1,41 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="UTF-8" />
+<style>
+  body {
+    width: 320px;
+    font-family: "Segoe UI", system-ui, sans-serif;
+    background: #1e293b;
+    color: #e2e8f0;
+    padding: 16px;
+    margin: 0;
+  }
+  h1 { font-size: 15px; margin: 0 0 10px; }
+  button {
+    width: 100%;
+    padding: 10px;
+    border: none;
+    border-radius: 8px;
+    background: #6366f1;
+    color: #fff;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.6; cursor: default; }
+  #status {
+    margin-top: 12px;
+    font-size: 13px;
+    color: #94a3b8;
+    white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+  <h1>Job Agent Autofill</h1>
+  <button id="fillBtn">Autofill this page</button>
+  <div id="status"></div>
+  <script src="popup.js"></script>
+</body>
+</html>
