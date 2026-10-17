@@ -6,10 +6,19 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.models.models import JobSource
-from app.schemas.schemas import JobSourceIn, JobSourceOut, JobSourceUpdate
+from app.schemas.schemas import JobSourceCatalogOut, JobSourceIn, JobSourceOut, JobSourceUpdate
 from app.services.job_discovery import discover_all_active, discover_for_source
+from app.services.job_sources.catalog import list_catalog
 
 router = APIRouter(prefix="/job-sources", tags=["job-sources"])
+
+
+@router.get("/catalog", response_model=list[JobSourceCatalogOut])
+def get_catalog(db: Session = Depends(get_db)):
+    """Known companies with their platform+slug already resolved, for a selection dropdown.
+    Excludes companies already being tracked."""
+    tracked = {(s.platform, s.slug) for s in db.query(JobSource.platform, JobSource.slug).all()}
+    return [entry for entry in list_catalog() if (entry.platform, entry.slug) not in tracked]
 
 
 @router.post("", response_model=JobSourceOut, status_code=201)

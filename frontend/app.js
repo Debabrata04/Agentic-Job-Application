@@ -847,6 +847,24 @@ document.getElementById("postingsNextBtn").addEventListener("click", () => {
 });
 
 // ---------- Job Sources ----------
+let jobSourceCatalog = [];
+
+async function loadJobSourceCatalog() {
+  const select = document.getElementById("src_company");
+  try {
+    jobSourceCatalog = await apiRequest("/job-sources/catalog");
+    if (!jobSourceCatalog.length) {
+      select.innerHTML = '<option value="">No companies left to add</option>';
+      return;
+    }
+    select.innerHTML = jobSourceCatalog
+      .map((c, i) => `<option value="${i}">${escapeHtml(c.company_name)}</option>`)
+      .join("");
+  } catch (err) {
+    select.innerHTML = '<option value="">Failed to load companies</option>';
+  }
+}
+
 async function loadJobSources() {
   const list = document.getElementById("sourcesList");
   list.innerHTML = "Loading...";
@@ -894,16 +912,17 @@ async function loadJobSources() {
 
 document.getElementById("addSourceBtn").addEventListener("click", async () => {
   const msg = document.getElementById("sourcesMsg");
-  const company_name = document.getElementById("src_company_name").value.trim();
-  const platform = document.getElementById("src_platform").value;
-  const slug = document.getElementById("src_slug").value.trim();
-  if (!company_name || !slug) return setMsg(msg, "Company name and slug are required", "error");
+  const select = document.getElementById("src_company");
+  const entry = jobSourceCatalog[select.value];
+  if (!entry) return setMsg(msg, "Pick a company from the list", "error");
   try {
     setMsg(msg, "Adding...");
-    await apiRequest("/job-sources", { method: "POST", body: { company_name, platform, slug, is_active: true } });
+    await apiRequest("/job-sources", {
+      method: "POST",
+      body: { company_name: entry.company_name, platform: entry.platform, slug: entry.slug, is_active: true },
+    });
     setMsg(msg, "Added.", "success");
-    document.getElementById("src_company_name").value = "";
-    document.getElementById("src_slug").value = "";
+    await loadJobSourceCatalog();
     loadJobSources();
   } catch (err) {
     setMsg(msg, err.message, "error");
@@ -936,6 +955,7 @@ function loadAll() {
   loadRoles();
   loadApplications();
   loadJobPostings();
+  loadJobSourceCatalog();
   loadJobSources();
 }
 
