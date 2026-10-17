@@ -170,6 +170,12 @@ class JobSourceUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 
+class JobSourceCatalogOut(BaseModel):
+    company_name: str
+    platform: str
+    slug: str
+
+
 class JobSourceOut(BaseModel):
     id: uuid.UUID
     company_name: str

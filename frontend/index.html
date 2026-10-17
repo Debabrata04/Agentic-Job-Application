@@ -243,16 +243,12 @@
         <h2>Companies to Poll for Job Postings</h2>
         <p class="meta">This is where you tell the job-discovery cycle which companies' career pages to check every 6 hours.</p>
         <div class="grid2">
-          <div><label>Company name</label><input id="src_company_name" placeholder="e.g. Stripe" /></div>
           <div>
-            <label>Platform</label>
-            <select id="src_platform">
-              <option value="greenhouse">Greenhouse</option>
-              <option value="lever">Lever</option>
-              <option value="smartrecruiters">SmartRecruiters</option>
+            <label>Company</label>
+            <select id="src_company">
+              <option value="">Loading companies...</option>
             </select>
           </div>
-          <div><label>Slug (the company identifier the platform's API expects)</label><input id="src_slug" placeholder="e.g. stripe" /></div>
         </div>
         <button id="addSourceBtn">Add company</button>
         <button id="discoverAllBtn" class="secondary">Poll all companies now</button>
