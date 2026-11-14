@@ -17,10 +17,6 @@ function sendDebuggerCommand(tabId, sessionId, method, params) {
   });
 }
 
-// Downloads the resume to the user's own Downloads folder (CDP's
-// DOM.setFileInputFiles needs a real local path, not a byte stream - this
-// is the one unavoidable side effect of true automatic attachment) and
-// waits for the download to actually finish before returning its path.
 async function downloadResumeLocally(resumeUrl, resumeFilename) {
   const fullUrl = `${API_BASE}${resumeUrl}`;
   const suggestedName = `job-agent-resume/${resumeFilename || "resume.pdf"}`;
