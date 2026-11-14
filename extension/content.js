@@ -1,198 +1,185 @@
-/**
- * Content script - runs once per frame (all_frames: true in manifest.json),
- * including cross-origin iframes like Greenhouse's embedded application form.
- * That's the whole reason this is an extension instead of a bookmarklet: a
- * bookmarklet runs in the TOP frame's JS context and can't reach into a
- * cross-origin iframe (blocked by the Same-Origin Policy) - a content script
- * is injected directly INTO each frame by the browser itself, so it has
- * native access to that frame's own DOM regardless of origin.
- *
- * Same label-matching heuristic as the old bookmarklet.js (fuzzy match on
- * aria-label/placeholder/name/label[for]) - kept here since bookmarklet.js
- * is no longer the active mechanism.
- */
+// Fills form fields in this frame using data from the Job Agent backend.
+// Matching is by label text, same labels the backend's own Playwright run
+// used when generating filled_answers - so exact (normalized) match is the
+// common case, with substring fallback for minor label drift.
 
-function labelTextFor(el) {
-  var text =
-    el.getAttribute("aria-label") ||
-    el.getAttribute("placeholder") ||
-    el.getAttribute("name") ||
-    "";
-  if (!text) {
-    // react-select (and many other component libraries) label their input via
-    // aria-labelledby pointing at a separate element's id, rather than a
-    // placeholder/aria-label/label[for] - e.g. <input aria-labelledby="country-label">.
-    var labelledBy = el.getAttribute("aria-labelledby");
-    if (labelledBy) {
-      text = labelledBy
-        .split(/\s+/)
-        .map(function (id) {
-          var ref = document.getElementById(id);
-          return ref ? ref.textContent : "";
-        })
-        .join(" ");
+function normalize(text) {
+  return (text || "").toLowerCase().trim().replace(/\s+/g, " ").replace(/[*:]+$/, "").trim();
+}
+
+function getFieldLabel(field) {
+  if (field.labels && field.labels.length) {
+    const text = field.labels[0].innerText || field.labels[0].textContent;
+    if (text && text.trim()) return text.trim();
+  }
+  const ariaLabel = field.getAttribute("aria-label");
+  if (ariaLabel && ariaLabel.trim()) return ariaLabel.trim();
+  const ariaLabelledBy = field.getAttribute("aria-labelledby");
+  if (ariaLabelledBy) {
+    const el = document.getElementById(ariaLabelledBy);
+    if (el && el.innerText && el.innerText.trim()) return el.innerText.trim();
+  }
+  const placeholder = field.getAttribute("placeholder");
+  if (placeholder && placeholder.trim()) return placeholder.trim();
+  // Some ATS platforms (confirmed on Lever) render the real question text as
+  // a sibling "label" element inside a shared question container, with no
+  // <label>, aria-label/labelledby, or placeholder on the field itself, and
+  // the field nested a level or two below rather than directly adjacent to
+  // the label - so the plain previousElementSibling walk below never finds
+  // it either. Same fix as the backend's own Playwright filler
+  // (application_filler.py) uses server-side: walk up to the nearest
+  // question-like container and pull the first label-like descendant that
+  // doesn't itself contain the field.
+  const container = field.closest('[class*="question" i], fieldset') || field.closest("li");
+  if (container) {
+    const candidates = container.querySelectorAll('[class*="label" i]');
+    for (const c of candidates) {
+      if (c.contains(field)) continue;
+      const clone = c.cloneNode(true);
+      clone.querySelectorAll('[class*="required" i]').forEach((r) => r.remove());
+      const text = (clone.innerText || clone.textContent || "").trim();
+      if (text) return text;
     }
   }
-  if (!text && el.id) {
-    var labelEl = document.querySelector('label[for="' + el.id + '"]');
-    if (labelEl) text = labelEl.textContent;
+  // Fall back to the nearest preceding text in the DOM (common pattern when
+  // a form uses no real <label> element, just adjacent text).
+  let sibling = field.previousElementSibling;
+  while (sibling) {
+    const text = sibling.innerText || sibling.textContent;
+    if (text && text.trim()) return text.trim();
+    sibling = sibling.previousElementSibling;
   }
-  return (text || "").trim().toLowerCase();
+  return "";
 }
 
-function isReactSelectInput(el) {
-  return (
-    el.tagName.toLowerCase() === "input" &&
-    el.getAttribute("role") === "combobox" &&
-    el.getAttribute("aria-haspopup") === "true"
-  );
+// Native setters bypass React/Vue's tracked value - plain field.value = x
+// leaves the framework's internal state out of sync, so typed-looking input
+// never "sticks" from the framework's point of view. This is the standard
+// workaround: call the native setter, then dispatch the events the framework
+// listens for, same as application_filler.py does server-side via Playwright.
+function setReactValue(field, value) {
+  const proto = field.tagName === "TEXTAREA" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+  setter.call(field, value);
+  field.dispatchEvent(new Event("input", { bubbles: true }));
+  field.dispatchEvent(new Event("change", { bubbles: true }));
 }
 
-/** react-select's input only filters a list that renders elsewhere in the DOM
- * when you type into it - there's no value to just "set". Real selection
- * needs: open it, type to filter, wait for the matching [role=option] to
- * render, then click it (same as a real user would, since nothing here is a
- * native form control react-select will accept a raw .value on). */
-function fillReactSelectLike(el, value) {
-  return new Promise(function (resolve) {
-    el.focus();
-    console.log("[JobAgent] fillReactSelectLike: focusing/clicking", el, "target value:", value);
-    el.click();
-    var setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value").set;
-    setter.call(el, value);
-    el.dispatchEvent(new Event("input", { bubbles: true }));
+function fillField(field, value) {
+  const tag = field.tagName;
+  const type = (field.getAttribute("type") || "").toLowerCase();
 
-    var attempts = 0;
-    var poll = setInterval(function () {
-      attempts++;
-      var options = document.querySelectorAll('[role="option"]');
-      console.log("[JobAgent] poll attempt", attempts, "- found", options.length, "[role=option] element(s):",
-        Array.prototype.map.call(options, function (o) { return o.textContent.trim(); }));
-      var target = String(value).trim().toLowerCase();
-      var match =
-        Array.prototype.find.call(options, function (o) {
-          return o.textContent.trim().toLowerCase() === target;
-        }) ||
-        Array.prototype.find.call(options, function (o) {
-          return o.textContent.trim().toLowerCase().indexOf(target) !== -1;
-        });
-      if (match) {
-        console.log("[JobAgent] matched option, clicking:", match);
-        clearInterval(poll);
-        match.scrollIntoView({ block: "nearest" });
-        match.click();
-        resolve(true);
-      } else if (attempts > 15) {
-        console.log("[JobAgent] gave up after", attempts, "attempts - no matching option ever appeared for value:", value);
-        clearInterval(poll);
-        el.blur();
-        resolve(false);
+  if (tag === "SELECT") {
+    const target = normalize(value);
+    for (const option of field.options) {
+      if (normalize(option.text) === target || normalize(option.text).includes(target)) {
+        field.value = option.value;
+        field.dispatchEvent(new Event("change", { bubbles: true }));
+        return true;
       }
-    }, 200);
-  });
-}
-
-function bestLabelMatch(fieldLabel, labels) {
-  var best = null;
-  var bestScore = 0;
-  for (var i = 0; i < labels.length; i++) {
-    var candidate = labels[i].toLowerCase();
-    if (!fieldLabel || !candidate) continue;
-    var score = 0;
-    if (fieldLabel === candidate) score = 100;
-    else if (fieldLabel.indexOf(candidate) !== -1 || candidate.indexOf(fieldLabel) !== -1) {
-      score = Math.min(fieldLabel.length, candidate.length);
     }
-    if (score > bestScore) {
-      bestScore = score;
-      best = labels[i];
+    return false;
+  }
+
+  if (type === "checkbox" || type === "radio") {
+    const target = normalize(value);
+    if (target === "yes" || target === "true" || target === normalize(field.value)) {
+      field.click();
+      return true;
     }
+    return false;
   }
-  return bestScore > 0 ? best : null;
+
+  if (tag === "INPUT" || tag === "TEXTAREA") {
+    setReactValue(field, value);
+    return true;
+  }
+
+  return false;
 }
 
-function fillNative(el, value) {
-  var tag = el.tagName.toLowerCase();
-  if (tag === "select") {
-    var opt = Array.prototype.find.call(el.options, function (o) {
-      return o.text.trim().toLowerCase() === String(value).trim().toLowerCase();
-    });
-    if (opt) el.value = opt.value;
-    else return false;
-  } else {
-    var proto = tag === "textarea" ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
-    var setter = Object.getOwnPropertyDescriptor(proto, "value").set;
-    setter.call(el, value); // bypasses some frameworks' input blocking
+// Any answer value that looks like a document filename (the backend's own
+// Playwright run only ever puts a filename here, for whatever field it found
+// the resume upload slot under - could be labeled "Attach", "Resume/CV",
+// "Upload Resume", anything) - used as a second, label-independent signal
+// that a file input is the resume slot. A regex on the label text alone
+// isn't enough: confirmed directly that this exact Stripe form labels its
+// upload field just "Attach", which "resume|cv|cover letter" never matches.
+const RESUME_FILENAME_RE = /\.(pdf|docx?|rtf|odt)$/i;
+
+function autofillFrame(answers, skipFilePicker) {
+  const normalizedAnswers = {};
+  for (const [label, value] of Object.entries(answers)) {
+    normalizedAnswers[normalize(label)] = value;
   }
-  el.dispatchEvent(new Event("input", { bubbles: true }));
-  el.dispatchEvent(new Event("change", { bubbles: true }));
-  el.dispatchEvent(new Event("blur", { bubbles: true }));
-  return true;
-}
+  const hasResumeLikeAnswer = Object.values(answers).some((v) => typeof v === "string" && RESUME_FILENAME_RE.test(v));
 
-async function autofillThisFrame(answers) {
-  var labels = Object.keys(answers);
-  var fields = document.querySelectorAll("input:not([type=hidden]), textarea, select");
-  console.log("[JobAgent] autofillThisFrame start -", location.href, "- found", fields.length, "field(s), have", labels.length, "answer label(s):", labels);
-  var filledCount = 0;
-  var filledLabels = [];
-  var filePickersOpened = [];
+  const fields = document.querySelectorAll("input:not([type=hidden]), textarea, select");
+  let filledCount = 0;
+  const filePickersOpened = [];
 
-  for (var i = 0; i < fields.length; i++) {
-    var el = fields[i];
+  for (const field of fields) {
+    const label = getFieldLabel(field);
 
-    // No script anywhere - extension or not - can programmatically put a file
-    // into an <input type=file>; browsers hard-block it for security (it's
-    // why even Playwright needs a privileged CDP call, not DOM manipulation,
-    // to do this). Best we can do: open the native file picker for the user,
-    // so they only have to browse to the file instead of finding the button.
-    if (el.tagName.toLowerCase() === "input" && el.type === "file") {
-      var label = labelTextFor(el);
-      if (/resume|cv|cover letter/.test(label) && filePickersOpened.length === 0) {
-        try {
-          el.click();
-          filePickersOpened.push(label || "file upload");
-        } catch (e) {
-          // ignore - clicking can fail if this isn't within a direct user gesture
-        }
+    // No script, anywhere, can set a file input's value - hard browser
+    // security restriction. Best we can do is open the OS picker for the
+    // user to browse to the file themselves. Checked here, BEFORE the
+    // label-match gate below (not inside fillField, which the loop only
+    // reaches once a label already matched an answers key) - a live page's
+    // resume/CV field can be labeled all sorts of things ("Resume/CV",
+    // "Upload Resume", "Attach", etc.), so this matches on EITHER a label
+    // keyword OR (when any backend answer is itself a document filename -
+    // meaning the backend found a resume upload slot somewhere) the mere
+    // presence of a file input at all, since most ATS forms have exactly
+    // one. Confirmed regression against the previously-committed version of
+    // this file, which always matched file inputs by label alone.
+    if ((field.getAttribute("type") || "").toLowerCase() === "file") {
+      // skipFilePicker is true when popup.js already attached the resume via
+      // Chrome's debugger protocol (DOM.setFileInputFiles) before sending
+      // this message - clicking the field here would pop open a picker on
+      // top of an already-filled input, undoing nothing but confusing to see.
+      if (
+        !skipFilePicker &&
+        (/resume|cv|cover letter|attach|upload/i.test(label) || hasResumeLikeAnswer) &&
+        filePickersOpened.length === 0
+      ) {
+        field.click();
+        filePickersOpened.push(label || "file upload");
       }
       continue;
     }
 
-    var fieldLabel = labelTextFor(el);
-    var match = bestLabelMatch(fieldLabel, labels);
-    console.log("[JobAgent] field:", el, "detected label:", JSON.stringify(fieldLabel), "-> matched answer:", match);
-    if (!match) continue;
+    if (!label) continue;
+    const normalizedLabel = normalize(label);
 
-    var reactSelect = isReactSelectInput(el);
-    console.log("[JobAgent] routing via", reactSelect ? "fillReactSelectLike" : "fillNative", "for match:", match);
-    var filled = reactSelect
-      ? await fillReactSelectLike(el, answers[match])
-      : fillNative(el, answers[match]);
+    let value = normalizedAnswers[normalizedLabel];
+    if (value === undefined) {
+      // Substring fallback - the page's label and the backend's captured
+      // label can differ slightly (e.g. trailing "(optional)" text).
+      const matchKey = Object.keys(normalizedAnswers).find(
+        (k) => normalizedLabel.includes(k) || k.includes(normalizedLabel)
+      );
+      if (matchKey) value = normalizedAnswers[matchKey];
+    }
+    if (value === undefined) continue;
 
-    if (filled) {
+    const result = fillField(field, value);
+    if (result) {
       filledCount++;
-      filledLabels.push(match);
     }
   }
 
-  return {
-    filledCount: filledCount,
-    filledLabels: filledLabels,
-    totalFields: fields.length,
-    filePickersOpened: filePickersOpened,
-  };
+  return { filledCount, totalFields: fields.length, filePickersOpened };
 }
 
 chrome.runtime.onMessage.addListener(function (message, sender, sendResponse) {
   if (message && message.type === "autofill") {
-    autofillThisFrame(message.answers || {})
-      .then(function (result) {
-        sendResponse({ ok: true, frameUrl: location.href, result: result });
-      })
-      .catch(function (err) {
-        sendResponse({ ok: false, frameUrl: location.href, error: err.message });
-      });
-    return true; // keep the message channel open for the async response above
+    try {
+      const result = autofillFrame(message.answers || {}, !!message.skipFilePicker);
+      sendResponse({ ok: true, result, frameUrl: window.location.href });
+    } catch (err) {
+      sendResponse({ ok: false, error: String(err) });
+    }
   }
+  return true;
 });

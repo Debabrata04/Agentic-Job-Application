@@ -7,6 +7,7 @@ from app.routers import (
     job_sources,
     matching,
     profile,
+    referrals,
     resumes,
     target_roles,
     users,
@@ -31,6 +32,7 @@ app.include_router(documents.router)
 app.include_router(job_sources.router)
 app.include_router(job_postings.router)
 app.include_router(matching.router)
+app.include_router(referrals.router)
 
 
 @app.get("/health")

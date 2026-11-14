@@ -1,4 +1,4 @@
-const DEFAULT_API_BASE = "http://15.206.230.236:8000";
+const DEFAULT_API_BASE = "http://localhost:8000";
 
 const state = {
   apiBase: localStorage.getItem("apiBase") || DEFAULT_API_BASE,
@@ -685,7 +685,15 @@ async function loadApplications() {
       const optionalMissing = a.optional_missing_fields || [];
       const matchedSkills = a.matched_skills || [];
       const missingSkills = a.missing_skills || [];
-      const filledCount = a.filled_answers ? Object.keys(a.filled_answers).length : 0;
+      const filledAnswers = a.filled_answers || {};
+      const filledCount = Object.keys(filledAnswers).length;
+      // gemini_filled_fields is a subset of filled_answers' keys - the ones
+      // the keyword matcher couldn't map (odd label wording) that the Gemini
+      // fallback answered instead, from profile/resume data. Everything else
+      // in filled_answers came from the fast, deterministic keyword matcher.
+      const geminiFields = a.gemini_filled_fields || [];
+      const geminiSet = new Set(geminiFields);
+      const keywordFilledEntries = Object.entries(filledAnswers).filter(([label]) => !geminiSet.has(label));
       item.innerHTML = `
         <div>
           <div class="title">${escapeHtml(jobLabel)} <span class="badge">${escapeHtml(STATUS_LABELS[a.status] || a.status)}</span></div>
@@ -696,6 +704,8 @@ async function loadApplications() {
             ${missing.length ? ` · Missing (required): ${missing.map(escapeHtml).join(", ")}` : ""}
             ${optionalMissing.length ? ` · Missing (optional): ${optionalMissing.map(escapeHtml).join(", ")}` : ""}
           </div>
+          ${keywordFilledEntries.length ? `<div class="meta">Filled from your profile: ${keywordFilledEntries.map(([label, value]) => `${escapeHtml(label)} = ${escapeHtml(value)}`).join(", ")}</div>` : ""}
+          ${geminiFields.length ? `<div class="meta">Filled by Gemini (odd-worded fields matched from your profile/resume): ${geminiFields.map((label) => `${escapeHtml(label)} = ${escapeHtml(filledAnswers[label] ?? "")}`).join(", ")}</div>` : ""}
           ${matchedSkills.length ? `<div class="meta">Skills matched: ${matchedSkills.map(escapeHtml).join(", ")}</div>` : ""}
           ${missingSkills.length ? `<div class="meta">Skills the JD wants that your profile doesn't show: ${missingSkills.map(escapeHtml).join(", ")}</div>` : ""}
           ${a.review_reason ? `<div class="meta">${escapeHtml(a.review_reason)}</div>` : ""}
@@ -957,7 +967,103 @@ function loadAll() {
   loadJobPostings();
   loadJobSourceCatalog();
   loadJobSources();
+  loadReferralMatches();
 }
+
+// ---------- Referrals ----------
+function renderReferralMatches(matches) {
+  const list = document.getElementById("referralsList");
+  if (!matches.length) {
+    list.innerHTML = `<p class="meta">No matches yet - import your LinkedIn connections CSV above, or none of your connections currently work at a company with an open posting.</p>`;
+    return;
+  }
+  list.innerHTML = matches
+    .map((m) => {
+      const connectionLines = m.connections
+        .map((c) => {
+          const name = `${c.first_name || ""} ${c.last_name || ""}`.trim() || "(name unknown)";
+          const position = c.position ? ` - ${escapeHtml(c.position)}` : "";
+          const link = c.url ? ` <a href="${escapeHtml(c.url)}" target="_blank" rel="noopener">profile</a>` : "";
+          return `<li>${escapeHtml(name)}${position}${link}</li>`;
+        })
+        .join("");
+      const postingLines = m.job_postings
+        .map((p) => `<li>${escapeHtml(p.title)}${p.url ? ` - <a href="${escapeHtml(p.url)}" target="_blank" rel="noopener">view</a>` : ""}</li>`)
+        .join("");
+      return `
+        <div class="item">
+          <strong>${escapeHtml(m.company)}</strong>
+          <div class="meta">Connections there:</div>
+          <ul>${connectionLines}</ul>
+          <div class="meta">Open roles:</div>
+          <ul>${postingLines}</ul>
+        </div>`;
+    })
+    .join("");
+}
+
+async function loadReferralMatches() {
+  try {
+    const matches = await apiRequest(userPath("/referrals/matches"));
+    renderReferralMatches(matches);
+  } catch (err) {
+    setMsg(document.getElementById("referralsMsg"), err.message, "error");
+  }
+}
+
+document.getElementById("uploadConnectionsBtn").addEventListener("click", async () => {
+  const msg = document.getElementById("referralsMsg");
+  const fileInput = document.getElementById("connectionsFile");
+  const file = fileInput.files[0];
+  if (!file) return setMsg(msg, "Choose the Connections CSV from your LinkedIn data export first", "error");
+
+  const form = new FormData();
+  form.append("file", file);
+  try {
+    setMsg(msg, "Importing and matching...");
+    const result = await apiRequest(userPath("/referrals/import"), { method: "POST", form, isFormData: true });
+    setMsg(
+      msg,
+      `Imported ${result.imported} connection(s). Found ${result.matches.length} company match(es).` +
+        (result.email_sent ? " Emailed you the list." : " (Email not sent - check SMTP settings.)"),
+      "success"
+    );
+    renderReferralMatches(result.matches);
+    fileInput.value = "";
+  } catch (err) {
+    setMsg(msg, err.message, "error");
+  }
+});
+
+document.getElementById("addConnectionBtn").addEventListener("click", async () => {
+  const msg = document.getElementById("referralsMsg");
+  const company = document.getElementById("conn_company").value.trim();
+  if (!company) return setMsg(msg, "Company is required", "error");
+
+  const payload = {
+    first_name: document.getElementById("conn_first_name").value.trim() || null,
+    last_name: document.getElementById("conn_last_name").value.trim() || null,
+    company,
+    position: document.getElementById("conn_position").value.trim() || null,
+    url: document.getElementById("conn_url").value.trim() || null,
+  };
+  try {
+    setMsg(msg, "Adding...");
+    const result = await apiRequest(userPath("/referrals/manual"), { method: "POST", body: payload });
+    setMsg(
+      msg,
+      `Added. Found ${result.matches.length} company match(es).` +
+        (result.email_sent ? " Emailed you the list." : " (Email not sent - check SMTP settings.)"),
+      "success"
+    );
+    renderReferralMatches(result.matches);
+    ["conn_first_name", "conn_last_name", "conn_company", "conn_position", "conn_url"].forEach((id) => {
+      document.getElementById(id).value = "";
+    });
+  } catch (err) {
+    setMsg(msg, err.message, "error");
+  }
+});
 
 if (state.userId) {
   showDashboard();

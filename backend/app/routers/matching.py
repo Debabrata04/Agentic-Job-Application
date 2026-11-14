@@ -1,3 +1,5 @@
+import re
+import urllib.parse
 import uuid
 from datetime import datetime
 
@@ -20,6 +22,7 @@ def _store_prefill_result_and_notify(db: Session, application: Application, user
     application.filled_answers = result["filled_answers"]
     application.missing_fields = result["missing_fields"]
     application.optional_missing_fields = result.get("optional_missing_fields") or []
+    application.gemini_filled_fields = result.get("gemini_filled_fields") or []
     application.screenshot_path = result["screenshot_path"]
     application.prefilled_at = datetime.utcnow()
     application.status = (
@@ -32,12 +35,17 @@ def _store_prefill_result_and_notify(db: Session, application: Application, user
     job_label = f"{job_posting.title} at {job_posting.company}" if job_posting else "a job"
     raw_apply_url = result.get("apply_url") or (job_posting.url if job_posting else None)
     # #jobagent_app_id=... is a URL fragment - never sent to the server, purely
-    # client-side - so it rides along with the link for the bookmarklet (see
-    # frontend/bookmarklet.js) to read, without changing where the link goes.
+    # client-side - so it rides along with the link for the extension (reads
+    # it from the page URL) without changing where the link goes. This is the
+    # scalable path: the extension runs in the user's OWN browser, on their
+    # OWN device, wherever they open the email - unlike server-side Playwright
+    # (launch-live / "Open and fill live"), which only makes sense when
+    # backend and user are the same machine, i.e. local dev, never once this
+    # is hosted for other people.
     apply_url = f"{raw_apply_url}#jobagent_app_id={application.id}" if raw_apply_url else None
     apply_line = (
         f"\n\nApply here: {apply_url}"
-        "\n(Once there, click your \"Autofill this application\" bookmarklet to fill it in your own browser.)"
+        "\n(Click the Job Agent Autofill extension icon, then \"Autofill this page\" to fill it in automatically.)"
         if apply_url else ""
     )
 
@@ -165,24 +173,6 @@ def retry_failed_applications(user_id: uuid.UUID, background_tasks: BackgroundTa
     return {"queued": count}
 
 
-@router.get("/applications/{application_id}/filled-answers")
-def get_filled_answers(application_id: uuid.UUID, db: Session = Depends(get_db)):
-    """Used by the browser extension (extension/) to autofill the real
-    application page in the user's own browser from its popup context - the
-    email link alone can never do this, since the Playwright fill happens in a
-    separate, already-closed server-side browser session. Keyed by
-    application_id alone (not nested under /users/{id}/) since that's all the
-    extension has on hand (reads it from the page URL)."""
-    application = db.get(Application, application_id)
-    if not application:
-        raise HTTPException(status_code=404, detail="Application not found")
-    return {
-        "filled_answers": application.filled_answers or {},
-        "missing_fields": application.missing_fields or [],
-        "optional_missing_fields": application.optional_missing_fields or [],
-    }
-
-
 @router.post("/users/{user_id}/applications/{application_id}/open-live")
 def open_application_live_endpoint(user_id: uuid.UUID, application_id: uuid.UUID, db: Session = Depends(get_db)):
     """Launches a real, visible Chromium window on this machine's desktop,
@@ -196,6 +186,95 @@ def open_application_live_endpoint(user_id: uuid.UUID, application_id: uuid.UUID
         raise HTTPException(status_code=404, detail="Application not found")
     open_application_live(str(application_id))
     return {"status": "opening"}
+
+
+@router.get("/applications/by-job-url")
+def get_application_by_job_url(url: str, db: Session = Depends(get_db)):
+    """Lets the extension find the right application purely from the page
+    it's already on - the #jobagent_app_id fragment in the email link covers
+    the normal case, but requiring that fragment (or worse, prompting the
+    user to paste an ID manually) breaks the moment someone opens the apply
+    page any other way - bookmark, dashboard click, retyped URL, etc.
+
+    Matches on JobPosting.external_id (the ATS's own stable job id - already
+    stored on every posting for dedup, see the unique constraint on (source,
+    external_id)), extracted from anywhere in the given URL via regex - not
+    on URL structure, which turned out to be unreliable for this. Confirmed
+    directly against one real posting: Stripe's careers site serves the SAME
+    job under three different URL shapes depending on how you arrive -
+    "/jobs/search?gh_jid=8243615" (the original, API-sourced URL),
+    "/careers/listing/staff-machine-learning-engineer-radar/8243615?
+    gh_jid=8243615" (a 307 redirect target), and "/careers/apply/staff-
+    machine-learning-engineer-radar/8243615" (where the browser actually
+    lands, no query string at all). The one constant across all three is the
+    numeric id "8243615" appearing somewhere in the URL.
+
+    Different ATS platforms use different id formats though - Greenhouse's
+    gh_jid is numeric, but Lever's job id is a full UUID (confirmed directly:
+    a Palantir/Lever posting's external_id is "2cd25c0b-088d-4a5c-9b96-
+    1165a33fe652", which a digits-only regex never matches at all, 404ing on
+    every Lever posting regardless of URL stability). Both patterns are
+    tried, UUID first since it's the more specific/reliable match."""
+    candidate_ids = re.findall(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", url, re.IGNORECASE)
+    candidate_ids += re.findall(r"\d{5,}", url)
+    job_posting = None
+    for candidate_id in candidate_ids:
+        job_posting = db.query(JobPosting).filter(JobPosting.external_id == candidate_id).first()
+        if job_posting:
+            break
+    if not job_posting:
+        base_url = url.split("#")[0].rstrip("/")
+        job_posting = db.query(JobPosting).filter(JobPosting.url.ilike(base_url)).first()
+    if not job_posting:
+        raise HTTPException(status_code=404, detail="No job posting found for this URL")
+
+    application = (
+        db.query(Application)
+        .filter(Application.job_posting_id == job_posting.id)
+        .order_by(Application.created_at.desc())
+        .first()
+    )
+    if not application:
+        raise HTTPException(status_code=404, detail="No application found for this job posting")
+
+    return _filled_answers_payload(application)
+
+
+def _filled_answers_payload(application: Application) -> dict:
+    """Shared shape returned by both lookup paths (by application_id and by
+    job URL) - includes a resume_url/resume_filename pair so the extension
+    can download the actual resume file and hand it to Chrome's debugger
+    protocol (DOM.setFileInputFiles) for true automatic attachment, not just
+    opening a file picker for the user to browse to it themselves."""
+    resume_url = None
+    resume_filename = None
+    if application.resume_id:
+        resume_url = f"/users/{application.user_id}/resumes/{application.resume_id}/download"
+        if application.resume and application.resume.original_filename:
+            resume_filename = application.resume.original_filename
+    return {
+        "application_id": str(application.id),
+        "filled_answers": application.filled_answers or {},
+        "missing_fields": application.missing_fields or [],
+        "optional_missing_fields": application.optional_missing_fields or [],
+        "gemini_filled_fields": application.gemini_filled_fields or [],
+        "resume_url": resume_url,
+        "resume_filename": resume_filename,
+    }
+
+
+@router.get("/applications/{application_id}/filled-answers")
+def get_filled_answers(application_id: uuid.UUID, db: Session = Depends(get_db)):
+    """Used by the browser extension (extension/) to autofill the real
+    application page in the user's own browser from its popup context - the
+    email link alone can never do this, since the Playwright fill happens in a
+    separate, already-closed server-side browser session. Keyed by
+    application_id alone (not nested under /users/{id}/) since that's all the
+    extension has on hand (reads it from the page URL)."""
+    application = db.get(Application, application_id)
+    if not application:
+        raise HTTPException(status_code=404, detail="Application not found")
+    return _filled_answers_payload(application)
 
 
 @router.get("/users/{user_id}/applications/{application_id}/screenshot")

@@ -56,6 +56,7 @@
         <button class="tab-btn" data-tab="appsTab">Applications</button>
         <button class="tab-btn" data-tab="postingsTab">Job Postings</button>
         <button class="tab-btn" data-tab="sourcesTab">Job Sources</button>
+        <button class="tab-btn" data-tab="referralsTab">Referrals</button>
       </div>
 
       <!-- Profile -->
@@ -203,15 +204,24 @@
         <p class="meta">Auto-matched and pre-filled every 6 hours. Review the filled answers and screenshot, submit it yourself on the job site, then mark it as submitted here.</p>
         <div class="list-item" style="margin-bottom:14px;">
           <div>
-            <div class="title">Autofill via browser extension</div>
+            <div class="title">Autofill via browser extension (recommended)</div>
             <div class="meta">
               One-time setup: open <code>chrome://extensions</code>, enable "Developer mode" (top right),
               click "Load unpacked", and select the <code>extension/</code> folder from the project.
-              Then, on any real job application page (even ones with an embedded iframe form, like Greenhouse),
-              click the extension's icon in your toolbar and hit "Autofill this page" - it reads the application ID
-              from the page URL (opened from an email link) and fills the form directly, including inside iframes.
-              (The earlier bookmarklet approach doesn't work for iframe-embedded forms - browsers block that at
-              the JavaScript level; the extension can reach inside because it's injected per-frame by the browser itself.)
+              Then, from the apply link in your email (or "Open application form" below), click the
+              extension icon and hit "Autofill this page" - it fills the real form directly in your own
+              browser, including inside embedded iframes (e.g. Greenhouse).
+            </div>
+          </div>
+        </div>
+        <div class="list-item" style="margin-bottom:14px;">
+          <div>
+            <div class="title">Autofill: "Open and fill live" (local use only)</div>
+            <div class="meta">
+              Launches a real, visible browser window on this machine and fills the form directly -
+              works well here since the dashboard and backend are the same machine. Note: this opens
+              the window wherever the backend runs, so it only makes sense for local use, not once this
+              is hosted for other people - use the extension above for that.
             </div>
           </div>
         </div>
@@ -254,6 +264,32 @@
         <button id="discoverAllBtn" class="secondary">Poll all companies now</button>
         <p id="sourcesMsg" class="msg"></p>
         <div id="sourcesList" class="list"></div>
+      </div>
+
+      <!-- Referrals -->
+      <div id="referralsTab" class="tab-pane card hidden">
+        <h2>Referral Contacts</h2>
+        <p class="meta">
+          We never log into LinkedIn or scrape your connections - that violates LinkedIn's Terms of Service even for
+          personal use. Instead: export your own connections from LinkedIn (Settings &amp; Privacy &rarr; Data privacy &rarr;
+          "Get a copy of your data" &rarr; Connections), then upload the CSV it emails you here. We'll match the companies
+          your connections work at against your open job postings and email you the list - you decide who to contact.
+        </p>
+        <div class="upload-row">
+          <input id="connectionsFile" type="file" accept=".csv" />
+          <button id="uploadConnectionsBtn">Import connections &amp; find matches</button>
+        </div>
+        <p class="meta">In a hurry? Skip the export and add a connection you remember by hand instead:</p>
+        <div class="grid2">
+          <div><label>First name</label><input id="conn_first_name" /></div>
+          <div><label>Last name</label><input id="conn_last_name" /></div>
+          <div><label>Company</label><input id="conn_company" placeholder="e.g. Stripe" /></div>
+          <div><label>Position</label><input id="conn_position" /></div>
+          <div><label>LinkedIn profile URL (optional)</label><input id="conn_url" /></div>
+        </div>
+        <button id="addConnectionBtn">Add connection &amp; find matches</button>
+        <p id="referralsMsg" class="msg"></p>
+        <div id="referralsList" class="list"></div>
       </div>
     </section>
   </main>

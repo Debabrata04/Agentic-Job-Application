@@ -38,10 +38,39 @@ _SKILL_PATTERNS = [
     for skill in SKILL_VOCAB
 ]
 
-# Ordered low -> high. Used to compare JD seniority vs candidate's most recent title.
-SENIORITY_LEVELS = [
-    "intern", "junior", "entry", "associate", "mid-level", "senior",
-    "staff", "principal", "lead", "director", "vp", "head of",
+# Years-of-experience bands, ordered low -> high, each with the title words that
+# typically signal it. Ranges overlap deliberately (e.g. 8-12 Lead/Staff and
+# 10-15 Principal/Architect both cover 10-12) - real career ladders aren't a
+# strict partition, and someone at year 11 can reasonably target either. When
+# matching by years, band_from_years() returns the *highest* band whose floor
+# the candidate has reached, since that's the most senior band they already
+# qualify for - not the lowest or an arbitrary pick among overlapping bands.
+SENIORITY_BANDS = [
+    ("intern", 0, 0, ["intern", "graduate trainee", "fresher"]),
+    ("entry", 0, 1, ["entry-level", "entry level", "graduate engineer", "junior associate"]),
+    ("junior", 1, 2, ["junior developer", "junior engineer", "associate"]),
+    ("mid", 2, 5, ["software engineer", "engineer ii", "analyst", "consultant"]),
+    ("senior", 5, 8, ["senior engineer", "senior analyst", "senior developer", "senior"]),
+    ("lead_staff", 8, 12, ["lead engineer", "staff engineer", "technical lead", "staff", "lead"]),
+    ("principal_architect", 10, 15, ["principal engineer", "solution architect", "principal consultant", "principal", "architect"]),
+    ("director_manager", 12, 18, ["director", "senior engineering manager", "engineering manager"]),
+    ("vp_exec", 15, 20, ["vp of engineering", "head of engineering", "vp", "head of"]),
+    ("csuite", 20, None, ["cto", "cio", "chief ai officer", "distinguished engineer", "chief"]),
+]
+
+# Back-compat name some callers may still reference; prefer SENIORITY_BANDS.
+SENIORITY_LEVELS = [name for name, *_ in SENIORITY_BANDS]
+
+# Word-boundary patterns per band, same approach as _SKILL_PATTERNS - a naive
+# "word in text" substring check is unsafe here because short acronyms like
+# "cto", "cio", "vp" are prone to false positives inside ordinary words (e.g.
+# "director" contains the literal substring "cto": di-re-CTO-r).
+_SENIORITY_PATTERNS = [
+    (
+        name,
+        [re.compile(r"(?<![a-z0-9])" + re.escape(word.lower()) + r"(?![a-z0-9])") for word in title_words],
+    )
+    for name, _lo, _hi, title_words in SENIORITY_BANDS
 ]
 
 
@@ -53,12 +82,28 @@ def extract_skills(text: str | None) -> set[str]:
 
 
 def detect_seniority(text: str | None) -> str | None:
+    """Infer a band purely from title/body wording. Prefer band_from_years()
+    when you have an actual years-of-experience number - text matching is a
+    fallback for when you don't (e.g. a JD with no explicit years mentioned)."""
     if not text:
         return None
     text_lower = text.lower()
-    # highest-ranked match wins (e.g. "Senior Staff Engineer" -> "staff")
-    found = [level for level in SENIORITY_LEVELS if level in text_lower]
+    # highest-ranked band wins on a tie (e.g. "Senior Staff Engineer" matches
+    # both "senior" and "staff" - staff/lead ranks higher, so it wins).
+    found = [name for name, patterns in _SENIORITY_PATTERNS if any(p.search(text_lower) for p in patterns)]
     return found[-1] if found else None
+
+
+def band_from_years(years: float | None) -> str | None:
+    """Maps a years-of-experience number to the highest band whose floor it
+    has reached - e.g. 2 years -> 'mid' (2-5 band). With overlapping bands,
+    11 years clears both lead_staff's floor (8) and principal_architect's
+    floor (10); since SENIORITY_BANDS is ordered low -> high, taking the
+    last match returns principal_architect, the more senior of the two."""
+    if years is None:
+        return None
+    matching = [name for name, lo, _hi, _words in SENIORITY_BANDS if years >= lo]
+    return matching[-1] if matching else None
 
 
 def seniority_rank(level: str | None) -> int | None:

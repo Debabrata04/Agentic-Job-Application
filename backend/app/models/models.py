@@ -5,17 +5,19 @@ from datetime import datetime
 from sqlalchemy import (
     Boolean,
     Column,
+    Computed,
     Date,
     DateTime,
     Enum,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
 )
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import relationship
 
 from app.core.database import Base
@@ -91,8 +93,13 @@ class TargetRole(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     title = Column(String, nullable=False)  # e.g. "Backend Engineer"
-    min_years_experience = Column(Float, nullable=True)
+    min_years_experience = Column(Float, nullable=True)  # required range on postings to match
     max_years_experience = Column(Float, nullable=True)
+    # The user's OWN self-reported years of experience for THIS role specifically
+    # (distinct from min/max above, which describe what postings to look for, and
+    # from User.years_of_experience, which is a single global figure). Falls back
+    # to User.years_of_experience when not set - see matching.py.
+    years_of_experience = Column(Float, nullable=True)
     keywords = Column(JSONB, nullable=True)  # list of must-have/nice-to-have keywords
     preferred_resume_id = Column(UUID(as_uuid=True), ForeignKey("resumes.id"), nullable=True)
     is_active = Column(Boolean, default=True)
@@ -112,9 +119,31 @@ class Resume(Base):
     original_filename = Column(String, nullable=False)
     parsed_text = Column(Text, nullable=True)
     is_active = Column(Boolean, default=True)
+    # Tech stack extracted from this resume's Skills/Projects/Experience sections
+    # via jjzha/jobbert_skill_extraction (see resume_skills.py), computed once on
+    # upload and reused for every subsequent match - not recomputed per-match.
+    extracted_skills = Column(JSONB, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     user = relationship("User", back_populates="resumes")
+    sections = relationship("ResumeSection", back_populates="resume", cascade="all, delete-orphan")
+
+
+class ResumeSection(Base):
+    """Regex-header-split chunks of a resume's text (Skills/Projects/Experience/
+    Education). Stored separately so skill extraction can run against just these
+    sections, not the whole resume blob (education/contact info add noise).
+    Cascade-deletes with the resume - deleting a resume wipes its sections too."""
+
+    __tablename__ = "resume_sections"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
+    resume_id = Column(UUID(as_uuid=True), ForeignKey("resumes.id", ondelete="CASCADE"), nullable=False)
+    section_type = Column(String, nullable=False)  # "skills", "projects", "experience", "education"
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    resume = relationship("Resume", back_populates="sections")
 
 
 class WorkExperience(Base):
@@ -195,7 +224,31 @@ class JobPosting(Base):
     contact_email = Column(String, nullable=True)  # for LinkedIn-post-style email applications
     discovered_at = Column(DateTime, default=datetime.utcnow)
 
-    __table_args__ = (UniqueConstraint("source", "external_id", name="uq_job_postings_source_external_id"),)
+    # Auto-maintained by Postgres itself (GENERATED ALWAYS AS ... STORED) - never
+    # written to directly, always reflects the current title/description. Used
+    # for BM25-style ranked keyword search via ts_rank (see job_search.py); not
+    # literal BM25 (that needs the pg_search extension, which doesn't support
+    # native Windows Postgres - see project history), but Postgres's own
+    # built-in full-text ranking, with zero extra infrastructure.
+    # regexp_replace(..., '/', ' ', 'g') matters: Postgres's tsvector parser
+    # treats a slash-joined pair like "PyTorch/TensorFlow" as ONE compound
+    # lexeme ("pytorch/tensorflow"), not two separate searchable words - this
+    # silently hid real postings from keyword search whenever a JD listed a
+    # skill as half of a slash-separated pair (e.g. "PyTorch/TensorFlow",
+    # "LangChain/LangGraph"). See migration f6bb0e0bb3c5 for the fix history.
+    search_vector = Column(
+        TSVECTOR,
+        Computed(
+            "to_tsvector('english', regexp_replace(coalesce(title, '') || ' ' || "
+            "coalesce(description, ''), '/', ' ', 'g'))",
+            persisted=True,
+        ),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("source", "external_id", name="uq_job_postings_source_external_id"),
+        Index("ix_job_postings_search_vector", "search_vector", postgresql_using="gin"),
+    )
 
     applications = relationship("Application", back_populates="job_posting")
 
@@ -228,6 +281,7 @@ class Application(Base):
     filled_answers = Column(JSONB, nullable=True)  # field label -> value, as filled by the Playwright prefiller
     missing_fields = Column(JSONB, nullable=True)  # required labels the prefiller found on the form but had no data for
     optional_missing_fields = Column(JSONB, nullable=True)  # same, but for non-required fields
+    gemini_filled_fields = Column(JSONB, nullable=True)  # subset of filled_answers' keys filled via the Gemini fallback, not the keyword matcher
     screenshot_path = Column(String, nullable=True)  # pre-fill screenshot, for you to review before submitting
     prefilled_at = Column(DateTime, nullable=True)
 
@@ -241,6 +295,30 @@ class Application(Base):
     job_posting = relationship("JobPosting", back_populates="applications")
     resume = relationship("Resume")
     notifications = relationship("Notification", back_populates="application", cascade="all, delete-orphan")
+
+
+class LinkedInConnection(Base):
+    """Rows imported from the user's own official LinkedIn data export
+    (Settings > Data Privacy > Get a copy of your data > "Connections" CSV).
+    Never scraped or accessed via LinkedIn login - that violates LinkedIn's
+    ToS and risks an account ban even for personal use. This is the user's
+    own exported data, re-uploaded here just to match against job_postings
+    companies for referral-contact suggestions."""
+
+    __tablename__ = "linkedin_connections"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=gen_uuid)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    first_name = Column(String, nullable=True)
+    last_name = Column(String, nullable=True)
+    company = Column(String, nullable=True)
+    position = Column(String, nullable=True)
+    email_address = Column(String, nullable=True)
+    url = Column(String, nullable=True)  # LinkedIn profile URL
+    connected_on = Column(Date, nullable=True)
+    imported_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (UniqueConstraint("user_id", "url", name="uq_linkedin_connections_user_url"),)
 
 
 class NotificationChannel(str, enum.Enum):

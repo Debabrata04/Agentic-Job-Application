@@ -17,13 +17,27 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.models import Application, CandidateProfile, JobPosting, Resume, User
+from app.services.gemini_filler import ask_gemini_for_field_value
+
+# Hard wall-clock budget for the field-scan + re-check portion of a fill, and
+# shared with prefill_application below as the basis for how long it'll wait
+# on the worker process before giving up on it as stuck. Confirmed necessary
+# against a real posting (Airbnb's Greenhouse embed), whose form kept
+# clearing its own combobox selections on every re-check pass.
+MAX_PREFILL_SECONDS = 180
 
 # Ordered (keywords, field_name) pairs - first keyword match against a field's
 # label/name/placeholder wins. Order matters: more specific keywords first.
 FIELD_KEYWORDS: list[tuple[list[str], str]] = [
     (["first name", "firstname", "given name"], "first_name"),
     (["last name", "lastname", "surname", "family name"], "last_name"),
-    (["full name", "your name"], "full_name"),
+    # Bare "name" matters as its own keyword, not just "full name"/"your name" -
+    # confirmed against a real Lever-hosted posting (Palantir) whose field is
+    # literally labeled just "Name", which neither of those phrases is a
+    # substring of. Safe to list after first/last name above: those match
+    # first and win for any label containing "first name"/"last name", so a
+    # bare "name" fallback here only catches genuinely unqualified labels.
+    (["full name", "your name", "name"], "full_name"),
     (["email"], "email"),
     (["phone", "mobile", "telephone"], "phone"),
     (["address line 1", "street address", "address1"], "address_line1"),
@@ -31,17 +45,25 @@ FIELD_KEYWORDS: list[tuple[list[str], str]] = [
     (["city"], "city"),
     (["state", "province"], "state"),
     (["zip", "postal"], "postal_code"),
-    (["country"], "country"),
     (["linkedin"], "linkedin_url"),
     (["portfolio", "website"], "portfolio_url"),
     (["github"], "github_url"),
     (["work authorization", "authorized to work", "legally authorized"], "work_authorization"),
     (["sponsorship", "require sponsorship", "visa sponsorship"], "requires_sponsorship"),
     (["relocate", "relocation"], "willing_to_relocate"),
+    # "country" listed after the above, not before - it's a single generic
+    # word prone to appearing inside unrelated longer questions (confirmed
+    # directly: "Are you legally authorized to work in the country in which
+    # you are applying?" and a visa-sponsorship question both contain
+    # "country" as a substring, and since this used to be checked first,
+    # both got mismatched to the country field - one attempted "India"
+    # against a Yes/No dropdown and failed outright, the other never even
+    # reached work_authorization's own keywords at all).
+    (["country"], "country"),
     (["years of experience", "experience (years)"], "years_of_experience"),
     (["gender"], "gender"),
     (["race", "ethnicity"], "race_ethnicity"),
-    (["veteran"], "veteran_status"),
+    (["veteran", "military status"], "veteran_status"),
     (["disability"], "disability_status"),
 ]
 
@@ -106,16 +128,97 @@ def _build_field_values(user: User, profile: Optional[CandidateProfile]) -> dict
     return {k: v for k, v in values.items() if v}
 
 
+def _build_candidate_context(field_values: dict[str, str], resume: Optional[Resume]) -> str:
+    """Plain-text summary handed to Gemini as the ONLY information it's
+    allowed to answer from (see gemini_filler.py) - reuses field_values
+    (already-resolved profile/user data) rather than re-reading the User/
+    CandidateProfile rows again, plus the active resume's parsed text for
+    anything profile fields don't cover (current employer, past job titles,
+    skills, education - the kind of thing a keyword-less "Current firm
+    you're part of?" field needs)."""
+    lines = [f"{key.replace('_', ' ')}: {value}" for key, value in field_values.items()]
+    context = "\n".join(lines)
+    if resume and resume.parsed_text:
+        context += "\n\nResume text:\n" + resume.parsed_text[:6000]
+    return context
+
+
 def _match_field_name(label_text: str) -> Optional[str]:
     label_lower = label_text.lower()
     for keywords, field_name in FIELD_KEYWORDS:
-        if any(kw in label_lower for kw in keywords):
-            return field_name
+        for kw in keywords:
+            # Word-boundary match, not plain substring - a short, generic
+            # keyword like "city" is also a substring of unrelated words
+            # (confirmed directly: "ethnicity" contains "city", so "What is
+            # your race or ethnicity?" was incorrectly matched to the city
+            # field and filled with the candidate's city instead of being
+            # left for the race/ethnicity dropdown). Multi-word keywords
+            # (e.g. "full name") still match as a phrase via the same regex.
+            if re.search(r"(?<![a-z0-9])" + re.escape(kw) + r"(?![a-z0-9])", label_lower):
+                return field_name
     return None
 
 
 _FIELD_SELECTOR = "input:not([type=hidden]), textarea, select"
 _APPLY_TEXT_RE = re.compile(r"apply", re.IGNORECASE)
+
+# Catches custom-styled autocomplete suggestion lists that DON'T use standard
+# ARIA combobox/listbox roles (so the react-select handling elsewhere in this
+# file never sees them) - confirmed directly against a real Lever posting:
+# typing a value into its "location" field shows a dropdown with class
+# "dropdown-location" and the typed text gets silently cleared on blur
+# unless an actual suggestion is clicked. Scoped to class-name patterns
+# rather than one exact string since different ATS platforms style these
+# differently, but "dropdown"/"suggest"/"autocomplete"/"option" cover the
+# common naming conventions.
+_SUGGESTION_ITEM_SELECTOR = (
+    '[class*="dropdown-location" i], [class*="dropdown-result" i], '
+    '[class*="suggestion" i], [class*="autocomplete-item" i], [role="option"]'
+)
+
+
+def _fill_text_like_field(page, field, value: str) -> None:
+    """Shared fill logic for plain text inputs/textareas - types the value,
+    then checks for a visible suggestion/autocomplete item that appeared as
+    a result (see _SUGGESTION_ITEM_SELECTOR above) and clicks it if present,
+    before falling back to a normal blur. Used by both the keyword-matched
+    path and the Gemini fallback, since either can hit this same class of
+    field."""
+    try:
+        field.click()
+        field.clear()
+        field.press_sequentially(value, delay=15)
+    except Exception:
+        field.fill(value)  # fallback for fields that reject real keystrokes
+        return
+
+    page.wait_for_timeout(600)  # let an async suggestion list render
+    try:
+        suggestions = page.locator(_SUGGESTION_ITEM_SELECTOR)
+        if suggestions.count() > 0 and suggestions.first.is_visible():
+            suggestions.first.click(timeout=3000)
+            return
+    except Exception:
+        pass
+
+    try:
+        field.evaluate("el => el.blur()")
+    except Exception:
+        pass
+
+    # Some masked/controlled inputs (confirmed on a phone field, which ended
+    # up with trailing digits duplicated, e.g. "+919818545003545003") can
+    # race their own reformat-as-you-type logic against press_sequentially's
+    # per-character keystrokes, corrupting the typed value. Verify what
+    # actually landed and, if it doesn't match what was typed, overwrite it
+    # once with .fill() - which sets the raw value atomically in one go
+    # rather than keystroke-by-keystroke, sidestepping the same race.
+    try:
+        current = field.input_value()
+        if current and current.strip() and current.strip() != value.strip():
+            field.fill(value)
+    except Exception:
+        pass
 
 
 def _count_fields(frame) -> int:
@@ -137,48 +240,157 @@ def _best_field_scope(page):
     return best_frame, best_count
 
 
-def _select_combobox_option(page, scope, field, value) -> bool:
+def _open_combobox_menu(page, field) -> None:
+    """Shared menu-opening step used by both _select_combobox_option and
+    _list_combobox_options - clicking the input alone doesn't open every
+    variant's menu (confirmed via logging: some only respond to a dedicated
+    "Toggle flyout"-style button sitting next to the input)."""
+    try:
+        field.scroll_into_view_if_needed(timeout=3000)
+    except Exception:
+        pass
+
+    opened = False
+    try:
+        field.click(timeout=3000)
+        opened = True
+    except Exception as e:
+        # A plain click can get intercepted by a previous combobox's menu
+        # still animating closed (confirmed: this field opened fine in
+        # isolation but failed in the real run immediately after an earlier
+        # combobox's option-click, same page) - the exception was being
+        # silently swallowed here, so the menu never got a second chance to
+        # open at all. Dismiss any stale menu and force through once.
+        print(f"[JobAgent] _open_combobox_menu: plain click failed ({e}), retrying with Escape+force", flush=True)
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
+        try:
+            field.click(timeout=3000, force=True)
+            opened = True
+        except Exception as e2:
+            print(f"[JobAgent] _open_combobox_menu: forced click also failed: {e2}", flush=True)
+
+    try:
+        # React's state update after the click handler fires is async - an
+        # immediate aria-expanded read can still see the pre-click "false"
+        # value even though the click itself genuinely worked, which made
+        # the raw-mouse-click fallback below fire as an unwanted SECOND
+        # click that just toggles an already-opening menu straight back
+        # closed (confirmed as the likely cause of a field that opens fine
+        # in isolation but consistently finds 0 options in the real run).
+        page.wait_for_timeout(150)
+        expanded = field.get_attribute("aria-expanded")
+        if expanded != "true":
+            # A second CLICK here is risky: react-select toggles the menu on
+            # each click, so if the first click's open genuinely did land
+            # (just not yet reflected in this aria-expanded read) a second
+            # click would re-close it, and clicking the wrong overlapping
+            # element entirely is also possible (force=True can "succeed"
+            # with no exception while hitting something else at the same
+            # coordinates). ArrowDown is a strictly additive, idempotent
+            # open: react-select's standard keyboard handler opens a closed
+            # menu on ArrowDown and otherwise just moves the active option -
+            # it never closes an already-open one, so it's safe to fire
+            # unconditionally here even if the first click already worked.
+            print(f"[JobAgent] _open_combobox_menu: aria-expanded={expanded!r} after click (opened={opened}), trying focus+ArrowDown", flush=True)
+            try:
+                field.focus()
+                page.keyboard.press("ArrowDown")
+                page.wait_for_timeout(150)
+            except Exception as e4:
+                print(f"[JobAgent] _open_combobox_menu: focus+ArrowDown failed: {e4}", flush=True)
+    except Exception as e3:
+        print(f"[JobAgent] _open_combobox_menu: aria-expanded check / raw click failed: {e3}", flush=True)
+    try:
+        container = field.locator(
+            "xpath=ancestor::*[contains(@class,'control') or contains(@class,'select')][1]"
+        )
+        toggle = container.locator('button[aria-label*="toggle" i], button[aria-label*="flyout" i], button[aria-label*="menu" i]')
+        if toggle.count() > 0:
+            toggle.first.click(timeout=3000)
+            page.wait_for_timeout(200)
+    except Exception as e:
+        print(f"[JobAgent] _open_combobox_menu: toggle lookup/click failed: {e}", flush=True)
+
+    # aria-expanded can flip to "true" (and the click/force-click report no
+    # exception) before the option list has actually finished rendering/
+    # animating into a Playwright-visible state - confirmed directly: a
+    # field with no error logged at all up to this point still read back 0
+    # [role=option] elements on the very first scan. A fixed settle wait
+    # here (not just the retry further down, which re-opens an already-open
+    # menu and does nothing new) gives slower renders a chance to finish
+    # before the first scan ever runs.
+    page.wait_for_timeout(250)
+
+
+def _list_combobox_options(page, scope, field) -> list[str]:
+    """Opens a react-select-style combobox's menu and reads back every
+    visible option's text, so a question that the keyword matcher (or a
+    simple yes/no guess) can't resolve can instead be handed to Gemini with
+    the field's REAL choices - same pattern already used for native <select>
+    and radio groups, extended to comboboxes which don't expose their
+    options without first opening the menu."""
+    # Opening the menu is flaky under real page load (confirmed directly:
+    # the exact same field returned 7 options on one run and 0 on another,
+    # no code change in between) - a couple of retries costs little against
+    # the alternative of silently giving up on an otherwise-fillable field.
+    for attempt in range(3):
+        _open_combobox_menu(page, field)
+        try:
+            options = scope.locator('[role="option"]:visible')
+            count = options.count()
+            texts = []
+            for oi in range(count):
+                try:
+                    text = options.nth(oi).inner_text().strip()
+                except Exception:
+                    continue
+                if text:
+                    texts.append(text)
+            if texts:
+                return texts
+        except Exception as e:
+            print(f"[JobAgent] _list_combobox_options: failed to read options (attempt {attempt}): {e}", flush=True)
+        page.wait_for_timeout(300)
+    return []
+
+
+def _select_combobox_option(page, scope, field, value, deadline_check=None) -> bool:
     """For react-select-style comboboxes (role=combobox, aria-haspopup=true):
     typing into them only filters a list rendered elsewhere in the DOM -
     nothing is actually "selected" (and the underlying form state stays
     empty) until you click the matching option, same as a real user would.
     Reading the input's typed text back (what the rest of this file does for
     plain inputs) is a false positive here - the filter text sits visibly in
-    the box either way, selected or not."""
-    try:
-        field.click()
-    except Exception:
-        pass
+    the box either way, selected or not.
 
-    try:
-        # This specific pattern (confirmed via live DOM inspection) opens the
-        # menu via a dedicated button - aria-label="Toggle flyout" - sitting
-        # next to the text input, not via clicking/focusing the input itself.
-        # Clicking the input alone left the menu permanently closed (0 options
-        # ever rendered, confirmed via logging) regardless of what was typed.
-        container = field.locator(
-            "xpath=ancestor::*[contains(@class,'control') or contains(@class,'select')][1]"
-        )
-        toggle = container.locator('button[aria-label*="toggle" i], button[aria-label*="flyout" i], button[aria-label*="menu" i]')
-        toggle_count = toggle.count()
-        print(f"[JobAgent] _select_combobox_option: toggle button count={toggle_count}", flush=True)
-        if toggle_count > 0:
-            toggle.first.click()
-            page.wait_for_timeout(200)
-    except Exception as e:
-        print(f"[JobAgent] _select_combobox_option: toggle lookup/click failed: {e}", flush=True)
+    deadline_check (optional): a zero-arg callable returning True once the
+    caller's overall time budget is up - checked on every polling attempt so
+    one stubborn combobox can't burn the whole budget by itself (up to ~45s
+    otherwise: 15 attempts x ~3s each when every click times out)."""
+    _open_combobox_menu(page, field)
 
-    try:
-        field.press_sequentially(str(value), delay=15)
-    except Exception:
-        try:
-            field.fill(str(value))
-        except Exception:
-            return False
+    def _normalize_option_text(s: str) -> str:
+        # Different companies word the same EEO/demographic option
+        # differently (confirmed directly: one posting's disability-status
+        # option read "No, I don't have a disability" while the candidate's
+        # stored value was "No, I do not have a disability") - expanding
+        # common contractions on both sides before comparing closes that
+        # specific gap without needing full fuzzy matching.
+        s = s.lower().strip().replace("’", "'")
+        for contraction, expanded in (
+            ("don't", "do not"), ("doesn't", "does not"), ("won't", "will not"),
+            ("can't", "cannot"), ("isn't", "is not"), ("aren't", "are not"),
+            ("i'm", "i am"),
+        ):
+            s = s.replace(contraction, expanded)
+        return s
 
-    target = str(value).strip().lower()
-    last_texts = []
-    for attempt in range(15):  # ~3s at 200ms
+    target = _normalize_option_text(str(value))
+
+    def _scan_and_click_matching_option():
         # :visible matters - other comboboxes on the page (e.g. the phone
         # field's country-code selector) can leave their own [role=option]
         # list mounted-but-hidden in the DOM, and an unscoped search can match
@@ -194,16 +406,70 @@ def _select_combobox_option(page, scope, field, value) -> bool:
             except Exception:
                 continue
             texts.append(text)
-            if text.lower() == target or target in text.lower():
+            if _normalize_option_text(text) == target or target in _normalize_option_text(text):
                 try:
-                    opt.click()
-                    return True
+                    opt.click(timeout=3000)
+                    return True, texts
+                except Exception:
+                    pass
+                try:
+                    opt.click(timeout=3000, force=True)
+                    return True, texts
                 except Exception as e:
-                    print(f"[JobAgent] _select_combobox_option: matched option but click failed: {e}", flush=True)
-                    return False
+                    print(f"[JobAgent] _select_combobox_option: matched option but click failed even with force: {e}", flush=True)
+                    return False, texts
+        return None, texts
+
+    # Try matching against whatever the menu already shows from the click/
+    # toggle above, BEFORE typing anything - typing runs the value through
+    # react-select's own substring filter, which can legitimately filter
+    # every real option out (confirmed directly: typing the full mismatched-
+    # wording value left 0 options rendered at all, so the comparison logic
+    # never even got a chance to run its own, more forgiving match).
+    matched, texts = _scan_and_click_matching_option()
+    if matched is True:
+        return True
+    if matched is False:
+        return False
+    for retry in range(3):
+        if texts:
+            break
+        # Menu found 0 options - on a fast-moving React form (e.g. right
+        # after an earlier field's own selection triggered a re-render), the
+        # click can land before the menu has actually mounted. Confirmed
+        # directly this is genuinely flaky (same field: 7 options on one
+        # run, 0 on the next, no code change between them) - several
+        # retries costs little against giving up on an otherwise-fillable
+        # field.
+        page.wait_for_timeout(300)
+        _open_combobox_menu(page, field)
+        matched, texts = _scan_and_click_matching_option()
+        if matched is True:
+            return True
+        if matched is False:
+            return False
+
+    try:
+        field.press_sequentially(str(value), delay=15)
+    except Exception:
+        try:
+            field.fill(str(value))
+        except Exception:
+            return False
+
+    last_texts = []
+    for attempt in range(15):  # ~3s at 200ms
+        if deadline_check and deadline_check():
+            print(f"[JobAgent] _select_combobox_option: deadline exceeded mid-attempt (attempt {attempt}), giving up early", flush=True)
+            return False
+        matched, texts = _scan_and_click_matching_option()
+        if matched is True:
+            return True
+        if matched is False:
+            return False
         last_texts = texts
         if attempt == 0 or attempt == 14:
-            print(f"[JobAgent] _select_combobox_option attempt {attempt}: target={target!r}, found {count} [role=option] element(s): {texts}", flush=True)
+            print(f"[JobAgent] _select_combobox_option attempt {attempt}: target={target!r}, found {len(texts)} [role=option] element(s): {texts}", flush=True)
         page.wait_for_timeout(200)
     print(f"[JobAgent] _select_combobox_option gave up. target={target!r}, last seen options: {last_texts}", flush=True)
     return False
@@ -249,7 +515,27 @@ def prefill_application(db: Session, application: Application) -> dict:
         target=_prefill_worker_process, args=(str(application.id), result_queue)
     )
     process.start()
-    outcome = result_queue.get()  # blocks until the worker finishes and posts a result
+    # MAX_PREFILL_SECONDS bounds the field-scan/re-check loop INSIDE the
+    # worker, but anything after that point (full_page screenshot,
+    # browser.close()) isn't covered by that in-worker deadline - confirmed
+    # directly: a real run hit the in-worker deadline correctly (logs showed
+    # it stopping the scan at ~192s) and then still never returned, because
+    # result_queue.get() here had no timeout at all and blocked forever on a
+    # worker stuck after that point. This generous outer bound (the in-worker
+    # budget plus room for screenshot/cleanup) is the actual backstop -
+    # terminate the process rather than hang the request indefinitely.
+    try:
+        outcome = result_queue.get(timeout=MAX_PREFILL_SECONDS + 60)
+    except Exception:
+        process.terminate()
+        process.join(timeout=10)
+        if process.is_alive():
+            process.kill()
+        raise RuntimeError(
+            f"Prefill worker did not finish within {MAX_PREFILL_SECONDS + 60}s "
+            "(stuck after the field-scan deadline, e.g. during screenshot capture "
+            "or browser shutdown) - terminated."
+        )
     process.join()
     if "error" in outcome:
         raise RuntimeError(outcome["error"])
@@ -313,11 +599,10 @@ def _prefill_application_impl(
       leaves a screenshot + field data behind to review later.
     - headless=False, close_browser=False: the "open and fill live" path
       (open_application_live) - a real, visible window on your own desktop,
-      left open so you can review and submit it yourself. Exists because
-      content-script-based autofill (the browser extension) can't reliably
-      replicate what Playwright already does correctly here - no CSP
-      restriction, no cross-origin iframe restriction, and more robust
-      actionability-aware interaction than hand-rolled DOM scripting.
+      left open so you can review and submit it yourself. Playwright drives
+      this directly rather than injecting a content script into the page -
+      no CSP restriction, no cross-origin iframe restriction, and more
+      robust actionability-aware interaction than hand-rolled DOM scripting.
     """
     from playwright.sync_api import sync_playwright
 
@@ -327,15 +612,18 @@ def _prefill_application_impl(
     resume = db.get(Resume, application.resume_id) if application.resume_id else None
 
     field_values = _build_field_values(user, profile)
+    candidate_context = _build_candidate_context(field_values, resume)
     filled_answers: dict[str, str] = {}
     missing_fields: list[str] = []
     optional_missing_fields: list[str] = []
+    gemini_filled_fields: list[str] = []  # subset of filled_answers' keys the keyword matcher missed and Gemini caught
 
     if not job_posting or not job_posting.url:
         return {
             "filled_answers": {},
             "missing_fields": ["Job posting has no apply URL"],
             "optional_missing_fields": [],
+            "gemini_filled_fields": [],
             "screenshot_path": None,
             "apply_url": None,
         }
@@ -349,6 +637,17 @@ def _prefill_application_impl(
 
     def _log(msg):
         print(f"[JobAgent +{_time.time() - _t0:5.1f}s] {msg}", flush=True)
+
+    # Past this deadline (module-level MAX_PREFILL_SECONDS), the field loop
+    # and re-check passes stop early and whatever got filled so far is
+    # returned - a partial, reviewable result beats a prefill that runs for
+    # 30+ minutes and never finishes (confirmed against a real posting,
+    # Airbnb's Greenhouse embed, whose form kept clearing its own combobox
+    # selections on every re-check pass).
+    _deadline = _t0 + MAX_PREFILL_SECONDS
+
+    def _deadline_exceeded():
+        return _time.time() > _deadline
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless)
@@ -390,13 +689,101 @@ def _prefill_application_impl(
             _log(f"scanning {count} field(s)")
             filled_field_refs = []  # (field, value, tag) - for the re-check pass below
             resume_attached = False
+            handled_radio_groups: set[str] = set()  # radio `name` groups already resolved this scan
+            handled_checkbox_groups: set[str] = set()  # checkbox labels already skipped this scan (avoid burning quota on each option)
+
+            def _try_gemini_fallback(field, label_text: str, is_required: bool) -> bool:
+                """Second-pass fallback for whatever the keyword matcher
+                (FIELD_KEYWORDS) couldn't map - only reached once that path
+                has already failed, see the loop below. Only handles plain
+                text-like inputs/textareas and native <select> - NOT
+                react-select comboboxes, which don't expose their option
+                list without first opening the menu (same complexity that
+                makes _select_combobox_option's own retry logic nontrivial;
+                extending Gemini to that case is a reasonable future step,
+                not done here). Returns False (never raises) on anything
+                that doesn't end in a confirmed, read-back-verified fill -
+                same as a keyword-matcher miss, the caller falls through to
+                missing_fields/optional_missing_fields."""
+                try:
+                    tag = field.evaluate("el => el.tagName.toLowerCase()")
+                    is_combobox = (
+                        field.get_attribute("role") == "combobox"
+                        and field.get_attribute("aria-haspopup") == "true"
+                    )
+                    if is_combobox:
+                        # Same closed-choice pattern as native <select> and
+                        # radio groups below: open the menu, read back the
+                        # REAL option labels, and let Gemini pick among them
+                        # rather than guessing free text (which a react-select
+                        # input would just filter against and never "select").
+                        options = _list_combobox_options(page, scope, field)
+                        if not options:
+                            return False
+                        value = ask_gemini_for_field_value(label_text, candidate_context, options)
+                        if not value:
+                            return False
+                        ok = _select_combobox_option(page, scope, field, value, deadline_check=_deadline_exceeded)
+                        if ok:
+                            filled_answers[label_text.strip()] = value
+                            gemini_filled_fields.append(label_text.strip())
+                            return True
+                        return False
+
+                    if field.get_attribute("type") == "checkbox":
+                        # A multi-select checkbox group (e.g. a 30-option
+                        # "Language Skills" list) shares one label across
+                        # every individual checkbox thanks to the container-
+                        # based label lookup above - without a dedup here,
+                        # each checkbox independently calls Gemini for the
+                        # SAME question, burning through the daily free-tier
+                        # quota before reaching any other field (confirmed
+                        # directly: ~30 wasted calls for one question).
+                        # Multi-select isn't supported by the single-value
+                        # ask_gemini_for_field_value() flow anyway (that's a
+                        # separate feature to add later) - skip outright
+                        # rather than let it drain quota other fields need.
+                        if label_text in handled_checkbox_groups:
+                            return False
+                        handled_checkbox_groups.add(label_text)
+                        return False
+
+                    options = None
+                    if tag == "select":
+                        options = field.evaluate("el => Array.from(el.options).map(o => o.text)")
+
+                    value = ask_gemini_for_field_value(label_text, candidate_context, options)
+                    if not value:
+                        return False
+                    _log(f"gemini fallback: label={label_text!r} -> {value!r}")
+
+                    if tag == "select":
+                        field.select_option(label=value)
+                    else:
+                        _fill_text_like_field(page, field, value)
+
+                    actual_value = field.input_value() if tag != "select" else field.evaluate(
+                        "el => el.options[el.selectedIndex] ? el.options[el.selectedIndex].text : ''"
+                    )
+                    if actual_value and actual_value.strip():
+                        filled_answers[label_text.strip()] = actual_value.strip()
+                        filled_field_refs.append((field, value, tag))
+                        gemini_filled_fields.append(label_text.strip())
+                        return True
+                    return False
+                except Exception as e:
+                    _log(f"gemini fallback: error for label={label_text!r}: {e}")
+                    return False
+
             for i in range(count):
+                if _deadline_exceeded():
+                    _log(f"deadline exceeded mid-scan at field {i}/{count} - stopping early")
+                    break
                 field = fields.nth(i)
                 try:
                     label_text = (
                         field.get_attribute("aria-label")
                         or field.get_attribute("placeholder")
-                        or field.get_attribute("name")
                         or ""
                     )
                     if not label_text:
@@ -406,15 +793,112 @@ def _prefill_application_impl(
                             if label_el.count():
                                 label_text = label_el.first.inner_text()
                     if not label_text:
+                        # Some ATS platforms (confirmed on Lever) render the real
+                        # question text as a sibling "label" element inside a
+                        # shared question container, with no aria-label,
+                        # placeholder, or <label for> association on the field
+                        # itself - every custom "cards[...]" question on a real
+                        # Palantir/Lever posting fell through all the way to the
+                        # opaque internal `name` attribute (e.g.
+                        # "cards[1c719ca9-...][field0]") with nothing for the
+                        # keyword matcher or Gemini to work with. Walk up to the
+                        # nearest question-like container and pull the first
+                        # label-like descendant that doesn't itself contain the
+                        # field (so a <select>'s own wrapper isn't mistaken for
+                        # the label), stripping any "required" marker span.
+                        try:
+                            label_text = field.evaluate(
+                                """el => {
+                                    // Prefer a container explicitly marked as a
+                                    // "question" (or a <fieldset>) over a bare <li> -
+                                    // radio options are themselves often each
+                                    // wrapped in their own inner <li>, which
+                                    // .closest('li') would grab instead of the
+                                    // outer question container that actually holds
+                                    // the real label (confirmed on a real Lever
+                                    // posting's Yes/No radio markup).
+                                    const container = el.closest('[class*="question" i], fieldset') || el.closest('li');
+                                    if (!container) return '';
+                                    const candidates = container.querySelectorAll('[class*="label" i]');
+                                    for (const c of candidates) {
+                                        if (c.contains(el)) continue;
+                                        const clone = c.cloneNode(true);
+                                        clone.querySelectorAll('[class*="required" i]').forEach(r => r.remove());
+                                        const text = clone.textContent.trim();
+                                        if (text) return text;
+                                    }
+                                    return '';
+                                }"""
+                            ) or ""
+                        except Exception:
+                            label_text = ""
+                    if not label_text:
+                        label_text = field.get_attribute("name") or ""
+                    if not label_text:
                         continue
 
                     is_required = field.get_attribute("required") is not None or field.get_attribute("aria-required") == "true"
 
-                    # Unlike a browser extension (no JS, anywhere, can touch a
-                    # file input's value - hard browser security restriction),
-                    # Playwright's set_input_files() goes through the browser's
-                    # automation protocol directly, bypassing that entirely -
-                    # no OS file picker dialog ever opens.
+                    # Radio groups get no handling anywhere else in this loop -
+                    # each <input type=radio> is just one more "field" to the
+                    # generic text-fill path below, which fails silently on a
+                    # radio (no text value to type/clear). Handle the whole
+                    # group once (dedup by `name`), asking Gemini to pick among
+                    # the group's real option labels (e.g. "Yes"/"No") rather
+                    # than the keyword matcher, since these are closed-choice
+                    # questions, not free text.
+                    if field.get_attribute("type") == "radio":
+                        radio_name = field.get_attribute("name") or ""
+                        if not radio_name or radio_name in handled_radio_groups:
+                            continue
+                        handled_radio_groups.add(radio_name)
+                        try:
+                            group = scope.locator(f'input[type="radio"][name="{radio_name}"]')
+                            group_count = group.count()
+                            option_labels = []
+                            for gi in range(group_count):
+                                gfield = group.nth(gi)
+                                opt_label = gfield.evaluate(
+                                    """el => {
+                                        const wrap = el.closest('label');
+                                        if (wrap) return wrap.textContent.trim();
+                                        const next = el.nextElementSibling;
+                                        if (next) return next.textContent.trim();
+                                        return el.value || '';
+                                    }"""
+                                ) or ""
+                                option_labels.append(opt_label.strip())
+
+                            picked = None
+                            if any(option_labels):
+                                picked = ask_gemini_for_field_value(label_text, candidate_context, option_labels)
+                            if picked:
+                                for gi in range(group_count):
+                                    if option_labels[gi].strip().lower() == picked.strip().lower():
+                                        group.nth(gi).click(timeout=3000)
+                                        filled_answers[label_text.strip()] = picked
+                                        gemini_filled_fields.append(label_text.strip())
+                                        break
+                                else:
+                                    picked = None
+                            if not picked:
+                                if is_required:
+                                    missing_fields.append(label_text.strip())
+                                else:
+                                    optional_missing_fields.append(label_text.strip())
+                        except Exception as e:
+                            _log(f"radio group fill error for {label_text!r}: {e}")
+                            if is_required:
+                                missing_fields.append(label_text.strip())
+                            else:
+                                optional_missing_fields.append(label_text.strip())
+                        continue
+
+                    # No JS, anywhere, can touch a file input's value - that's a
+                    # hard browser security restriction. Playwright's
+                    # set_input_files() goes through the browser's automation
+                    # protocol directly, bypassing that entirely - no OS file
+                    # picker dialog ever opens.
                     if field.get_attribute("type") == "file":
                         # The revealed file input's only "label" is usually just
                         # the Attach button's own text ("Attach") - confirmed via
@@ -462,9 +946,36 @@ def _prefill_application_impl(
                             # a much stronger confirmation than reading the filter
                             # text back (which sits there whether or not something
                             # was actually selected - false positive otherwise).
-                            combobox_ok = _select_combobox_option(page, scope, field, value)
+                            combobox_ok = _select_combobox_option(page, scope, field, value, deadline_check=_deadline_exceeded)
                             _log(f"combobox field label={label_text!r} -> selected={combobox_ok}")
+                            if not combobox_ok:
+                                # The hardcoded candidate value can fail to
+                                # match ANY real option even though the field
+                                # is genuinely the right one - confirmed
+                                # directly: stored "I am not a protected
+                                # veteran" matched none of the live options
+                                # ("I identify as a non-protected veteran",
+                                # etc.), only an exact-wording mismatch, not a
+                                # missing/wrong field. Re-open, read back the
+                                # real options, and let Gemini translate the
+                                # candidate's actual answer onto this site's
+                                # specific wording instead of giving up.
+                                options = _list_combobox_options(page, scope, field)
+                                if options:
+                                    remapped = ask_gemini_for_field_value(label_text, candidate_context, options)
+                                    if remapped:
+                                        combobox_ok = _select_combobox_option(page, scope, field, remapped, deadline_check=_deadline_exceeded)
+                                        if combobox_ok:
+                                            value = remapped
+                                            gemini_filled_fields.append(label_text.strip())
                             if combobox_ok:
+                                # The option-click's menu-close animation can
+                                # still be running when the NEXT combobox's
+                                # click lands, intercepting it (confirmed
+                                # directly: "military status" opened fine in
+                                # isolation but failed right after "race or
+                                # ethnicity" was filled in the same run).
+                                page.wait_for_timeout(300)
                                 filled_answers[label_text.strip()] = value
                                 filled_field_refs.append((field, value, "combobox"))
                             elif is_required:
@@ -484,15 +995,11 @@ def _prefill_application_impl(
                             # up a value visually once they see real keystrokes
                             # (observed: value present in the DOM and read back
                             # fine, but rendered invisible in the screenshot).
-                            # Simulate actual typing instead, then blur to trigger
-                            # any on-blur "touched" styling.
-                            try:
-                                field.click()
-                                field.clear()
-                                field.press_sequentially(value, delay=15)
-                                field.evaluate("el => el.blur()")
-                            except Exception:
-                                field.fill(value)  # fallback for fields that reject real keystrokes
+                            # _fill_text_like_field simulates real typing and also
+                            # handles custom-styled autocomplete suggestion lists
+                            # (confirmed necessary against a real Lever posting -
+                            # see its own docstring/comment for details).
+                            _fill_text_like_field(page, field, value)
 
                         # Framework-controlled forms (React/Vue-driven ATS embeds)
                         # can silently reset a field after .fill() - e.g. an input
@@ -510,6 +1017,8 @@ def _prefill_application_impl(
                             missing_fields.append(label_text.strip())
                         else:
                             optional_missing_fields.append(label_text.strip())
+                    elif not _deadline_exceeded() and _try_gemini_fallback(field, label_text, is_required):
+                        pass
                     elif is_required:
                         missing_fields.append(label_text.strip())
                     else:
@@ -527,8 +1036,13 @@ def _prefill_application_impl(
             # instead of checking just once.
             _log(f"starting re-check passes, tracking {len(filled_field_refs)} field(s)")
             for pass_num in range(6):  # ~18s total coverage at 3s apart
+                if _deadline_exceeded():
+                    _log(f"deadline exceeded before re-check pass {pass_num} - stopping early")
+                    break
                 page.wait_for_timeout(3000)
                 for field, value, tag in filled_field_refs:
+                    if _deadline_exceeded():
+                        break
                     try:
                         if tag == "combobox":
                             # Can't just read .input_value() to check this one -
@@ -539,7 +1053,7 @@ def _prefill_application_impl(
                             current = field.input_value()
                             if not current or not current.strip():
                                 _log(f"re-check pass {pass_num}: combobox value={value!r} was cleared, reselecting")
-                                _select_combobox_option(page, scope, field, value)
+                                _select_combobox_option(page, scope, field, value, deadline_check=_deadline_exceeded)
                             continue
                         current = (
                             field.input_value()
@@ -552,10 +1066,7 @@ def _prefill_application_impl(
                         if tag == "select":
                             field.select_option(label=value)
                         else:
-                            field.click()
-                            field.clear()
-                            field.press_sequentially(value, delay=15)
-                            field.evaluate("el => el.blur()")
+                            _fill_text_like_field(page, field, value)
                     except Exception as e:
                         _log(f"re-check pass {pass_num}: error re-filling: {e}")
                         continue
@@ -573,7 +1084,7 @@ def _prefill_application_impl(
                 pass
             page.wait_for_timeout(300)
             if close_browser:
-                page.screenshot(path=str(screenshot_path), full_page=True)
+                page.screenshot(path=str(screenshot_path), full_page=True, timeout=15000)
         finally:
             if close_browser:
                 browser.close()
@@ -593,6 +1104,7 @@ def _prefill_application_impl(
         "filled_answers": filled_answers,
         "missing_fields": sorted(set(missing_fields)),
         "optional_missing_fields": sorted(set(optional_missing_fields) - set(missing_fields)),
+        "gemini_filled_fields": sorted(set(gemini_filled_fields)),
         "screenshot_path": str(screenshot_path),
         "apply_url": job_posting.url,
     }

@@ -86,6 +86,7 @@ class ResumeOut(BaseModel):
     original_filename: str
     is_active: bool
     parsed_text: Optional[str] = None
+    extracted_skills: Optional[list[str]] = None
     created_at: datetime
 
     class Config:
@@ -157,6 +158,26 @@ class DocumentOut(BaseModel):
         from_attributes = True
 
 
+class LinkedInConnectionIn(BaseModel):
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    company: str
+    position: Optional[str] = None
+    url: Optional[str] = None
+
+
+class LinkedInConnectionOut(BaseModel):
+    id: uuid.UUID
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    company: Optional[str] = None
+    position: Optional[str] = None
+    url: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
 class JobSourceIn(BaseModel):
     company_name: str
     platform: str  # "greenhouse", "lever", "smartrecruiters"
@@ -207,6 +228,31 @@ class JobPostingOut(BaseModel):
         from_attributes = True
 
 
+class ReferralMatchOut(BaseModel):
+    company: str
+    connections: list[LinkedInConnectionOut]
+    job_postings: list[JobPostingOut]
+
+
+class ReferralImportResult(BaseModel):
+    imported: int
+    skipped: int
+    matches: list[ReferralMatchOut]
+    email_sent: bool
+
+
+class ReferralMessageRequest(BaseModel):
+    connection_id: uuid.UUID
+    job_posting_id: uuid.UUID
+
+
+class ReferralMessageOut(BaseModel):
+    connection_id: uuid.UUID
+    job_posting_id: uuid.UUID
+    job_id: str
+    message: str
+
+
 class ApplicationOut(BaseModel):
     id: uuid.UUID
     user_id: uuid.UUID
@@ -221,6 +267,7 @@ class ApplicationOut(BaseModel):
     filled_answers: Optional[dict] = None
     missing_fields: Optional[list[str]] = None
     optional_missing_fields: Optional[list[str]] = None
+    gemini_filled_fields: Optional[list[str]] = None
     screenshot_path: Optional[str] = None
     prefilled_at: Optional[datetime] = None
     applied_at: Optional[datetime] = None

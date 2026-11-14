@@ -33,7 +33,11 @@ def send_email(db: Session, user_id, to_email: str, subject: str, body: str, app
     msg.set_content(body)
 
     try:
-        with smtplib.SMTP(settings.smtp_host, settings.smtp_port) as server:
+        # timeout matters: without it this call can hang forever on a stalled
+        # connection (e.g. Gmail throttling after several sends in quick
+        # succession) - confirmed directly: a prefill request got stuck for
+        # 10+ minutes at near-zero CPU, consistent with a blocked socket read.
+        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=30) as server:
             server.starttls()
             server.login(settings.smtp_username, settings.smtp_app_password)
             server.send_message(msg)

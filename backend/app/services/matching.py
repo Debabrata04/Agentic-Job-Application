@@ -1,10 +1,8 @@
 import html
 import re
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Optional
 
-import numpy as np
 from sqlalchemy.orm import Session
 
 from app.models.models import (
@@ -16,14 +14,21 @@ from app.models.models import (
     User,
     WorkExperience,
 )
+from app.services.job_search import search_job_postings_by_keywords
 from app.services.resume_jd_scorer import aggregate_score_0_1, score_resume_jd_pairs
-from app.services.skills import detect_seniority, extract_skills, seniority_rank
+from app.services.skills import band_from_years, detect_seniority, extract_skills, seniority_rank
 
-# Thresholds against the composite score (semantic relevance + skill overlap +
-# seniority match, see _composite_score). Provisional starting points, not
-# calibrated against real outcome data yet - expect to retune once there's
-# enough real match/apply history to compare against.
-HIGH_SIMILARITY_THRESHOLD = 0.55
+# "Highly relevant" is decided by resume_jd_scorer's own aggregate score, not
+# the composite below. The model card (kasraahmadi/job-eval-modernbert)
+# documents no numeric threshold - only unlabeled qualitative bands (Strong
+# match / Promising fit / Stretch fit / Low alignment) over its 1-5 scale.
+# 0.75 on the rescaled 0-1 scale is our own interpretation of "Strong match"
+# as the top quartile (4.0-5.0 before rescaling) - not a published default.
+HIGH_RELEVANCE_THRESHOLD = 0.75
+
+# Below this composite score (relevance + skills + seniority blend, see
+# _composite_score), a job is discarded outright - no Application row at all.
+# Provisional, not calibrated against real outcome data yet.
 LOW_SIMILARITY_THRESHOLD = 0.30
 
 # How composite_score blends its signals. Any signal that can't be computed
@@ -35,22 +40,14 @@ SCORE_WEIGHTS = {"relevance": 0.5, "skills": 0.35, "seniority": 0.15}
 # treating it as a YOE mismatch worth flagging for review.
 YOE_TOLERANCE_YEARS = 1.0
 
-# Stage 1 (bi-encoder retrieval) narrows the whole discovered-postings pool
-# down to this many shortlist candidates per user. Stage 2 (cross-encoder
-# rerank, via resume_jd_scorer - a model fine-tuned specifically on resume<->JD
-# pairs) only runs on the shortlist, where the extra accuracy is worth the
-# extra compute - never on the full pool (could be thousands of postings).
-SHORTLIST_SIZE = 20
+# How many top-ranked (by ts_rank) postings to retrieve per resume from the
+# BM25-style keyword search before the seniority filter and cross-encoder
+# run. Same role SHORTLIST_SIZE played in the earlier bi-encoder-based
+# design - caps how many postings reach the expensive cross-encoder stage.
+BM25_SHORTLIST_SIZE = 50
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _YEARS_RE = re.compile(r"(\d+)\+?\s*(?:-|to)?\s*\d*\+?\s*years?", re.IGNORECASE)
-
-
-@lru_cache(maxsize=1)
-def _get_bi_encoder():
-    from sentence_transformers import SentenceTransformer
-
-    return SentenceTransformer("all-MiniLM-L6-v2")
 
 
 def clean_html(raw: Optional[str]) -> str:
@@ -65,12 +62,6 @@ def extract_required_years(jd_text: str) -> Optional[float]:
     if not match:
         return None
     return float(match.group(1))
-
-
-def embed_texts(texts: list[str]) -> np.ndarray:
-    """Batch-embeds many texts in one call - this is the 'cheap' part of stage 1."""
-    model = _get_bi_encoder()
-    return model.encode(texts, normalize_embeddings=True, batch_size=32, show_progress_bar=False)
 
 
 @dataclass
@@ -88,19 +79,21 @@ def _composite_score(
     relevance_score: float,
     candidate_skills: set[str],
     jd_skills: set[str],
-    candidate_seniority_text: str,
-    jd_seniority_text: str,
+    candidate_level: Optional[str],
+    jd_level: Optional[str],
 ) -> tuple[float, Optional[float], Optional[float]]:
     """Blend the stage-2 relevance score with skill overlap and seniority match.
 
     Any signal that can't be computed is dropped and the remaining weights
     re-normalized, rather than penalizing the score for missing data.
+    candidate_level/jd_level are seniority band names (see skills.band_from_years
+    and skills.detect_seniority) - resolved by the caller, since choosing between
+    a YOE-number-based band and a text-based fallback needs context this
+    function doesn't have.
     Returns (composite_score, skill_score_or_None, seniority_score_or_None).
     """
     skill_score = len(candidate_skills & jd_skills) / len(jd_skills) if jd_skills else None
 
-    candidate_level = detect_seniority(candidate_seniority_text)
-    jd_level = detect_seniority(jd_seniority_text)
     seniority_score = None
     if candidate_level is not None and jd_level is not None:
         candidate_rank = seniority_rank(candidate_level)
@@ -117,6 +110,28 @@ def _composite_score(
     total_weight = sum(SCORE_WEIGHTS[name] for name, _ in components)
     composite = sum(SCORE_WEIGHTS[name] * value for name, value in components) / total_weight
     return composite, skill_score, seniority_score
+
+
+def _resume_seniority_level(db: Session, user: User, resume: Resume) -> Optional[str]:
+    """A real YOE number (user-level, shared across all of a user's resumes)
+    always wins over text inference - it's unambiguous, whereas title wording
+    varies. Falls back to detecting seniority from this resume's own text
+    (plus the user's logged work-experience titles) only when no YOE is set."""
+    level = band_from_years(user.years_of_experience)
+    if level is not None:
+        return level
+    latest_titles = " ".join(
+        title for (title,) in db.query(WorkExperience.title).filter(WorkExperience.user_id == user.id).all()
+    )
+    return detect_seniority(f"{latest_titles} {resume.parsed_text or ''}")
+
+
+def _jd_seniority_level(job_posting: JobPosting, jd_text: str, required_years: Optional[float]) -> Optional[str]:
+    if required_years is not None:
+        level = band_from_years(required_years)
+        if level is not None:
+            return level
+    return detect_seniority(f"{job_posting.title or ''} {jd_text}")
 
 
 def _finalize_match(
@@ -140,17 +155,14 @@ def _finalize_match(
     matched_skills = sorted(candidate_skills & jd_skills)
     missing_skills = sorted(jd_skills - candidate_skills)
 
-    latest_titles = " ".join(
-        title for (title,) in db.query(WorkExperience.title).filter(WorkExperience.user_id == user.id).all()
-    )
-    candidate_seniority_text = f"{latest_titles} {best_resume.parsed_text or ''}"
-    jd_seniority_text = f"{job_posting.title or ''} {jd_text}"
+    required_years = extract_required_years(jd_text)
+    candidate_level = _resume_seniority_level(db, user, best_resume)
+    jd_level = _jd_seniority_level(job_posting, jd_text, required_years)
 
     composite_score, skill_score, seniority_score = _composite_score(
-        relevance_score, candidate_skills, jd_skills, candidate_seniority_text, jd_seniority_text
+        relevance_score, candidate_skills, jd_skills, candidate_level, jd_level
     )
 
-    required_years = extract_required_years(jd_text)
     yoe_ok = True
     yoe_note = None
     if required_years is not None and user.years_of_experience is not None:
@@ -166,7 +178,7 @@ def _finalize_match(
             "low", composite_score, str(best_resume.id), None, "Match score too low", matched_skills, missing_skills
         )
 
-    if composite_score >= HIGH_SIMILARITY_THRESHOLD and yoe_ok:
+    if relevance_score >= HIGH_RELEVANCE_THRESHOLD and yoe_ok:
         return MatchResult(
             "high",
             composite_score,
@@ -178,8 +190,8 @@ def _finalize_match(
         )
 
     reasons = []
-    if composite_score < HIGH_SIMILARITY_THRESHOLD:
-        reasons.append(f"Match score {composite_score:.2f} below high-confidence threshold")
+    if relevance_score < HIGH_RELEVANCE_THRESHOLD:
+        reasons.append(f"Relevance score {relevance_score:.2f} below high-confidence threshold ({HIGH_RELEVANCE_THRESHOLD})")
     if missing_skills:
         reasons.append(f"Missing skills: {', '.join(missing_skills)}")
     if not matched_target_role:
@@ -218,24 +230,26 @@ def _create_application(db: Session, user: User, job_posting: JobPosting, result
 
 
 def match_all_unmatched_jobs_for_user(db: Session, user: User) -> list[Application]:
-    """Two-stage matching: cheap bi-encoder retrieval across the whole unmatched
-    pool narrows it to a shortlist, then the slower but more accurate
-    cross-encoder reranks just that shortlist before final scoring.
+    """Per-resume BM25 retrieval (search_job_postings_by_keywords, using each
+    resume's stored extracted_skills - computed once at upload, reused here
+    every time, never recomputed per-match) narrows the whole discovered-
+    postings pool to a ranked shortlist - no model calls for this step. Every
+    job shortlisted by any resume then goes through the cross-encoder
+    (resume_jd_scorer, fine-tuned specifically on resume<->JD pairs); there is
+    no hard seniority pre-filter any more - seniority only affects the final
+    composite score gradually (_composite_score inside _finalize_match). A
+    job that's a candidate for more than one resume is scored against each
+    and only the higher-scoring resume is kept, so every job gets at most one
+    Application row.
     """
+    # str(...) here matters: search_job_postings_by_keywords below returns str
+    # ids, while row.job_posting_id from the ORM is a uuid.UUID - without this,
+    # the set subtraction at job_ids below silently never removes anything
+    # (UUID("x") != "x"), so already-applied jobs were never actually excluded.
     already_matched_job_ids = {
-        row.job_posting_id for row in db.query(Application.job_posting_id).filter(Application.user_id == user.id).all()
+        str(row.job_posting_id)
+        for row in db.query(Application.job_posting_id).filter(Application.user_id == user.id).all()
     }
-    query = db.query(JobPosting)
-    if already_matched_job_ids:
-        query = query.filter(JobPosting.id.notin_(already_matched_job_ids))
-
-    candidates = []  # (job_posting, jd_text)
-    for job_posting in query.all():
-        jd_text = clean_html(job_posting.description)
-        if jd_text:
-            candidates.append((job_posting, jd_text))
-    if not candidates:
-        return []
 
     resumes = (
         db.query(Resume)
@@ -245,35 +259,64 @@ def match_all_unmatched_jobs_for_user(db: Session, user: User) -> list[Applicati
     if not resumes:
         return []
 
-    # --- Stage 1: bi-encoder retrieval, cheap, run once across everything ---
-    resume_embeddings = embed_texts([r.parsed_text for r in resumes])
-    jd_embeddings = embed_texts([jd_text for _, jd_text in candidates])
+    shortlisted_job_ids_by_resume: dict = {}
+    all_shortlisted_job_ids: set = set()
+    for resume in resumes:
+        job_ids_and_ranks = search_job_postings_by_keywords(
+            db, resume.extracted_skills or [], limit=BM25_SHORTLIST_SIZE
+        )
+        job_ids = {jid for jid, _rank in job_ids_and_ranks} - already_matched_job_ids
+        shortlisted_job_ids_by_resume[resume.id] = job_ids
+        all_shortlisted_job_ids |= job_ids
 
-    # similarity matrix: (num_jobs, num_resumes); best resume per job = argmax along axis 1
-    sim_matrix = jd_embeddings @ resume_embeddings.T
-    best_resume_idx = sim_matrix.argmax(axis=1)
-    best_embedding_scores = sim_matrix[np.arange(len(candidates)), best_resume_idx]
-
-    ranked = sorted(
-        zip(candidates, best_resume_idx, best_embedding_scores),
-        key=lambda row: -row[2],
-    )
-    shortlist = [
-        (job_posting, jd_text, resumes[resume_idx], float(score))
-        for (job_posting, jd_text), resume_idx, score in ranked
-        if score >= LOW_SIMILARITY_THRESHOLD
-    ][:SHORTLIST_SIZE]
-    if not shortlist:
+    if not all_shortlisted_job_ids:
         return []
 
-    # --- Stage 2: cross-encoder rerank, only on the shortlist ---
-    pairs = [(best_resume.parsed_text, jd_text) for _, jd_text, best_resume, _ in shortlist]
-    aspect_scores = score_resume_jd_pairs(pairs)
-    relevance_scores = [aggregate_score_0_1(scores) for scores in aspect_scores]
+    shortlisted_postings = db.query(JobPosting).filter(JobPosting.id.in_(all_shortlisted_job_ids)).all()
+
+    jobs = []
+    jd_text_by_job_id = {}
+    for job_posting in shortlisted_postings:
+        jd_text = clean_html(job_posting.description)
+        if not jd_text:
+            continue
+        jobs.append(job_posting)
+        jd_text_by_job_id[job_posting.id] = jd_text
+    if not jobs:
+        return []
+
+    candidates_by_job: dict = {}
+    for job_posting in jobs:
+        # Seniority is no longer a hard pre-filter here - every resume that
+        # BM25 shortlisted for this job is a candidate. Seniority still
+        # factors into the final score via _composite_score/_finalize_match
+        # below, just gradually rather than as a reject/pass gate.
+        # job_posting.id is a uuid.UUID from the ORM; shortlisted_job_ids_by_resume
+        # holds str ids (from search_job_postings_by_keywords) - compare as str on
+        # both sides, since UUID("x") == "x" is always False in Python.
+        passing_resumes = [r for r in resumes if str(job_posting.id) in shortlisted_job_ids_by_resume[r.id]]
+        if passing_resumes:
+            candidates_by_job[job_posting.id] = passing_resumes
+
+    if not candidates_by_job:
+        return []
 
     results = []
-    for (job_posting, jd_text, best_resume, _embedding_score), relevance_score in zip(shortlist, relevance_scores):
-        result = _finalize_match(db, job_posting, user, best_resume, jd_text, float(relevance_score))
+    for job_posting in jobs:
+        resume_options = candidates_by_job.get(job_posting.id)
+        if not resume_options:
+            continue
+        jd_text = jd_text_by_job_id[job_posting.id]
+
+        pairs = [(r.parsed_text, jd_text) for r in resume_options]
+        aspect_scores_list = score_resume_jd_pairs(pairs)
+        relevance_scores = [aggregate_score_0_1(scores) for scores in aspect_scores_list]
+
+        best_idx = max(range(len(relevance_scores)), key=lambda i: relevance_scores[i])
+        best_resume = resume_options[best_idx]
+        best_relevance_score = relevance_scores[best_idx]
+
+        result = _finalize_match(db, job_posting, user, best_resume, jd_text, best_relevance_score)
         if result.bucket == "low":
             continue
         results.append(_create_application(db, user, job_posting, result))

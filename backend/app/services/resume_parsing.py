@@ -1,8 +1,10 @@
 from pathlib import Path
 from typing import Optional
 
+import pymupdf
 from docx import Document as DocxDocument
-from pypdf import PdfReader
+
+NEWLINE = chr(10)
 
 
 def extract_text(file_path: str) -> Optional[str]:
@@ -26,12 +28,19 @@ def extract_text(file_path: str) -> Optional[str]:
 
 
 def _extract_pdf(file_path: str) -> str:
-    reader = PdfReader(file_path)
-    pages = [page.extract_text() or "" for page in reader.pages]
-    return "\n".join(pages).strip()
+    """Uses PyMuPDF, not pypdf - pypdf concatenates adjacent text runs (e.g. a
+    bold keyword next to regular text) with no space between them, corrupting
+    real terms into nonsense tokens (seen on a real resume: "Milvus" became
+    "DiskANNinMilvus", "LoRA" became "LoRAto"), which then made every skill
+    NER extractor fail silently on that text. PyMuPDF's get_text() preserves
+    the actual word boundaries, confirmed against that same resume."""
+    doc = pymupdf.open(file_path)
+    pages = [page.get_text() for page in doc]
+    doc.close()
+    return NEWLINE.join(pages).strip()
 
 
 def _extract_docx(file_path: str) -> str:
     doc = DocxDocument(file_path)
     paragraphs = [p.text for p in doc.paragraphs]
-    return "\n".join(paragraphs).strip()
+    return NEWLINE.join(paragraphs).strip()

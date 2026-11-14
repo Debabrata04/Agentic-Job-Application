@@ -5,12 +5,40 @@ from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.models.models import Resume, User
+from app.models.models import Resume, ResumeSection, User
 from app.schemas.schemas import ResumeOut
 from app.services.resume_parsing import extract_text
+from app.services.resume_pdf_structure import get_header_boundary_lines
+from app.services.resume_sections import split_into_sections
+from app.services.resume_skills import extract_tech_stack
 from app.services.storage import delete_file, save_resume
 
 router = APIRouter(prefix="/users/{user_id}/resumes", tags=["resumes"])
+
+
+def _process_sections_and_skills(db: Session, resume: Resume) -> None:
+    """Splits parsed_text into sections, replaces any existing ResumeSection
+    rows for this resume (so reparse doesn't duplicate), then extracts the
+    tech stack from those sections and stores it on the resume. Runs once per
+    upload/reparse - never recomputed per-match, see resume_skills.py.
+
+    For PDF resumes, also runs a font-signature pass (resume_pdf_structure)
+    over the original file to find section-boundary lines that the
+    text-pattern heuristic alone might not recognize as headers (e.g.
+    "Patent") but which share the exact styling of this resume's own real
+    headers - DOCX/other formats fall back to text-pattern-only detection,
+    since PyMuPDF only reads PDF font metadata."""
+    db.query(ResumeSection).filter(ResumeSection.resume_id == resume.id).delete()
+
+    extra_boundary_lines = None
+    if resume.file_path.lower().endswith(".pdf"):
+        extra_boundary_lines = get_header_boundary_lines(resume.file_path)
+
+    sections = split_into_sections(resume.parsed_text, extra_boundary_lines=extra_boundary_lines)
+    for section_type, content in sections.items():
+        db.add(ResumeSection(resume_id=resume.id, section_type=section_type, content=content))
+
+    resume.extracted_skills = extract_tech_stack(resume.parsed_text, extra_boundary_lines=extra_boundary_lines)
 
 
 @router.post("", response_model=ResumeOut, status_code=201)
@@ -35,6 +63,8 @@ def upload_resume(
         parsed_text=extract_text(stored_path),
     )
     db.add(resume)
+    db.flush()  # assigns resume.id without committing, needed for ResumeSection FKs below
+    _process_sections_and_skills(db, resume)
     db.commit()
     db.refresh(resume)
     return resume
@@ -86,6 +116,7 @@ def reparse_resume(user_id: uuid.UUID, resume_id: uuid.UUID, db: Session = Depen
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
     resume.parsed_text = extract_text(resume.file_path)
+    _process_sections_and_skills(db, resume)
     db.commit()
     db.refresh(resume)
     return resume
