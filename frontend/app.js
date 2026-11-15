@@ -1,4 +1,9 @@
-const DEFAULT_API_BASE = "http://localhost:8000";
+// Defaults to wherever this page itself is being served from, so the
+// dashboard works out of the box when hosted alongside the API (as it now
+// is) on any host/IP, without needing a hardcoded value per deployment.
+// Falls back to localhost:8000 only when opened as a local file (no origin).
+const DEFAULT_API_BASE =
+  location.protocol === "file:" ? "http://localhost:8000" : location.origin;
 
 const state = {
   apiBase: localStorage.getItem("apiBase") || DEFAULT_API_BASE,
