@@ -85,6 +85,7 @@ class ResumeOut(BaseModel):
     label: str
     original_filename: str
     is_active: bool
+    years_of_experience: Optional[float] = None
     parsed_text: Optional[str] = None
     extracted_skills: Optional[list[str]] = None
     created_at: datetime

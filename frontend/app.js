@@ -206,7 +206,7 @@ async function loadResumes() {
       item.innerHTML = `
         <div>
           <div class="title">${escapeHtml(r.label)} ${r.is_active ? '<span class="badge">Active</span>' : ""}</div>
-          <div class="meta">${escapeHtml(r.original_filename)} · uploaded ${new Date(r.created_at).toLocaleDateString()}</div>
+          <div class="meta">${escapeHtml(r.original_filename)} · uploaded ${new Date(r.created_at).toLocaleDateString()}${r.years_of_experience != null ? ` · ${r.years_of_experience} yrs experience` : ""}</div>
         </div>
         <div class="actions">
           <button class="secondary" data-action="download">Download</button>
@@ -224,6 +224,7 @@ async function loadResumes() {
       item.querySelector('[data-action="edit"]').addEventListener("click", () => {
         editingResumeId = r.id;
         document.getElementById("resumeLabel").value = r.label;
+        document.getElementById("resumeYoe").value = r.years_of_experience != null ? r.years_of_experience : "";
         document.getElementById("resumeFile").removeAttribute("required");
         document.getElementById("uploadResumeBtn").textContent = "Save changes";
         document.getElementById("cancelResumeEditBtn").classList.remove("hidden");
@@ -245,6 +246,7 @@ let editingResumeId = null;
 function resetResumeForm() {
   editingResumeId = null;
   document.getElementById("resumeLabel").value = "";
+  document.getElementById("resumeYoe").value = "";
   document.getElementById("resumeFile").value = "";
   document.getElementById("uploadResumeBtn").textContent = "Upload resume";
   document.getElementById("cancelResumeEditBtn").classList.add("hidden");
@@ -255,6 +257,7 @@ document.getElementById("cancelResumeEditBtn").addEventListener("click", resetRe
 document.getElementById("uploadResumeBtn").addEventListener("click", async () => {
   const msg = document.getElementById("resumeMsg");
   const label = document.getElementById("resumeLabel").value.trim();
+  const yoe = document.getElementById("resumeYoe").value.trim();
   const fileInput = document.getElementById("resumeFile");
   const file = fileInput.files[0];
 
@@ -262,6 +265,7 @@ document.getElementById("uploadResumeBtn").addEventListener("click", async () =>
     if (!label) return setMsg(msg, "Label is required", "error");
     const form = new FormData();
     form.append("label", label);
+    if (yoe) form.append("years_of_experience", yoe);
     try {
       setMsg(msg, "Saving...");
       await apiRequest(userPath(`/resumes/${editingResumeId}`), { method: "PATCH", form, isFormData: true });
@@ -277,6 +281,7 @@ document.getElementById("uploadResumeBtn").addEventListener("click", async () =>
   if (!label || !file) return setMsg(msg, "Provide a label and a file", "error");
   const form = new FormData();
   form.append("label", label);
+  if (yoe) form.append("years_of_experience", yoe);
   form.append("file", file);
   try {
     setMsg(msg, "Uploading...");

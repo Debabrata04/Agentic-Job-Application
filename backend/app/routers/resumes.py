@@ -45,6 +45,7 @@ def _process_sections_and_skills(db: Session, resume: Resume) -> None:
 def upload_resume(
     user_id: uuid.UUID,
     label: str = Form(...),
+    years_of_experience: float | None = Form(None),
     file: UploadFile = None,
     db: Session = Depends(get_db),
 ):
@@ -58,6 +59,7 @@ def upload_resume(
     resume = Resume(
         user_id=user_id,
         label=label,
+        years_of_experience=years_of_experience,
         file_path=stored_path,
         original_filename=original_filename,
         parsed_text=extract_text(stored_path),
@@ -88,12 +90,14 @@ def update_resume(
     user_id: uuid.UUID,
     resume_id: uuid.UUID,
     label: str = Form(...),
+    years_of_experience: float | None = Form(None),
     db: Session = Depends(get_db),
 ):
     resume = db.query(Resume).filter(Resume.id == resume_id, Resume.user_id == user_id).first()
     if not resume:
         raise HTTPException(status_code=404, detail="Resume not found")
     resume.label = label
+    resume.years_of_experience = years_of_experience
     db.commit()
     db.refresh(resume)
     return resume

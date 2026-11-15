@@ -119,6 +119,10 @@ class Resume(Base):
     original_filename = Column(String, nullable=False)
     parsed_text = Column(Text, nullable=True)
     is_active = Column(Boolean, default=True)
+    # Manually entered by the user (never auto-extracted from resume text,
+    # which is unreliable) - the YOE used for the first-pass screening gate in
+    # matching.py, compared against each JD's Gemini-extracted requirement.
+    years_of_experience = Column(Float, nullable=True)
     # Tech stack extracted from this resume's Skills/Projects/Experience sections
     # via jjzha/jobbert_skill_extraction (see resume_skills.py), computed once on
     # upload and reused for every subsequent match - not recomputed per-match.
@@ -244,6 +248,15 @@ class JobPosting(Base):
             persisted=True,
         ),
     )
+
+    # Gemini-extracted JD requirements, computed once per posting (not once per
+    # resume/user/cycle) and cached here - see matching.py's first-pass YOE/
+    # profession screen, which runs before the expensive cross-encoder stage.
+    # gemini_screened distinguishes "tried, found nothing" from "never tried",
+    # so a failed/unconfigured Gemini call isn't retried every single cycle.
+    gemini_required_years = Column(Float, nullable=True)
+    gemini_related_professions = Column(JSONB, nullable=True)
+    gemini_screened = Column(Boolean, default=False)
 
     __table_args__ = (
         UniqueConstraint("source", "external_id", name="uq_job_postings_source_external_id"),

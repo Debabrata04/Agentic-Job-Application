@@ -14,6 +14,7 @@ from app.models.models import (
     User,
     WorkExperience,
 )
+from app.services.gemini_filler import extract_jd_requirements
 from app.services.job_search import search_job_postings_by_keywords
 from app.services.resume_jd_scorer import aggregate_score_0_1, score_resume_jd_pairs
 from app.services.skills import band_from_years, detect_seniority, extract_skills, seniority_rank
@@ -62,6 +63,50 @@ def extract_required_years(jd_text: str) -> Optional[float]:
     if not match:
         return None
     return float(match.group(1))
+
+
+def _get_or_extract_jd_requirements(db: Session, job_posting: JobPosting, jd_text: str) -> tuple:
+    """Gemini-based JD requirement extraction, cached on the JobPosting row so
+    it only runs once per job ever - not once per resume, user, or cycle.
+    gemini_screened is set True even on a failed/unconfigured call, so a
+    temporary Gemini outage doesn't get retried on every single cycle; the
+    screen below just lets candidates through when no signal is available."""
+    if job_posting.gemini_screened:
+        return job_posting.gemini_required_years, job_posting.gemini_related_professions or []
+
+    extracted = extract_jd_requirements(jd_text)
+    job_posting.gemini_required_years = extracted.get("required_years") if extracted else None
+    job_posting.gemini_related_professions = extracted.get("related_professions") if extracted else None
+    job_posting.gemini_screened = True
+    db.commit()
+    return job_posting.gemini_required_years, job_posting.gemini_related_professions or []
+
+
+def _passes_yoe_profession_screen(
+    db: Session, job_posting: JobPosting, jd_text: str, candidate_years: Optional[float], candidate_profession: Optional[str]
+) -> bool:
+    """First-pass screening gate, run before the expensive cross-encoder stage:
+    rejects a candidate outright if their self-reported resume YOE falls short
+    of what the JD (per Gemini) asks for, or if their target-role profession
+    isn't among the JD's Gemini-identified closely-related professions (e.g.
+    AI Engineer/ML Engineer/Data Scientist/Software Engineer are treated as
+    interchangeable for a role that could reasonably fit any of them).
+
+    Only screens on signals that are actually available - a resume with no
+    YOE entered, or a JD Gemini couldn't extract anything from, passes through
+    unscreened on that dimension rather than being blocked by missing data."""
+    required_years, related_professions = _get_or_extract_jd_requirements(db, job_posting, jd_text)
+
+    if required_years is not None and candidate_years is not None:
+        if candidate_years < required_years - YOE_TOLERANCE_YEARS:
+            return False
+
+    if related_professions and candidate_profession:
+        candidate_lower = candidate_profession.lower()
+        if not any(candidate_lower in p.lower() or p.lower() in candidate_lower for p in related_professions):
+            return False
+
+    return True
 
 
 @dataclass
@@ -297,6 +342,27 @@ def match_all_unmatched_jobs_for_user(db: Session, user: User) -> list[Applicati
         passing_resumes = [r for r in resumes if str(job_posting.id) in shortlisted_job_ids_by_resume[r.id]]
         if passing_resumes:
             candidates_by_job[job_posting.id] = passing_resumes
+
+    if not candidates_by_job:
+        return []
+
+    # First-pass screen: drop any (job, resume) pairing whose resume YOE falls
+    # short of the JD's Gemini-extracted requirement, or whose target-role
+    # profession isn't one Gemini considers closely related to this JD's role.
+    # Runs before the cross-encoder stage below since it's far cheaper and
+    # should cut the candidate pool down first, per the matching design.
+    screened_candidates_by_job: dict = {}
+    for job_posting, resume_options in candidates_by_job.items():
+        jd_text = jd_text_by_job_id[job_posting.id]
+        screened = []
+        for resume in resume_options:
+            target_role = db.query(TargetRole).filter(TargetRole.preferred_resume_id == resume.id).first()
+            candidate_profession = target_role.title if target_role else resume.label
+            if _passes_yoe_profession_screen(db, job_posting, jd_text, resume.years_of_experience, candidate_profession):
+                screened.append(resume)
+        if screened:
+            screened_candidates_by_job[job_posting.id] = screened
+    candidates_by_job = screened_candidates_by_job
 
     if not candidates_by_job:
         return []

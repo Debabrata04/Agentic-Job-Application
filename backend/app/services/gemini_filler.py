@@ -16,6 +16,9 @@ NONE here costs nothing new, it's the same fallback path that existed
 before this feature).
 """
 
+import json
+import re
+
 import httpx
 
 from app.core.config import settings
@@ -154,3 +157,79 @@ def draft_referral_message(candidate_context: str, job_context: str, connection_
         return None
 
     return text or None
+
+
+_JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def extract_jd_requirements(jd_text: str) -> dict | None:
+    """First-pass screening signal for matching.py: asks Gemini to read a job
+    description and extract (a) the minimum years of experience it asks for,
+    and (b) every closely-related profession/job-title a candidate in that
+    role could reasonably be called (e.g. a "Machine Learning Engineer" JD
+    should list "AI Engineer", "Data Scientist", "Software Engineer (ML)",
+    etc.) - this is what lets the screen treat those as interchangeable
+    instead of requiring an exact title match. Computed once per job posting
+    and cached on JobPosting (gemini_required_years/gemini_related_professions),
+    never recomputed per resume/user/cycle - see matching.py.
+
+    Returns {"required_years": float|None, "related_professions": list[str]}
+    or None if Gemini isn't configured, the call fails, or the response can't
+    be parsed - callers treat None as "no screening signal available" and let
+    the candidate through rather than blocking on a missing signal."""
+    if not settings.gemini_api_key or not jd_text.strip():
+        return None
+
+    prompt = (
+        "Read this job description and answer two questions as JSON only, "
+        "no other text:\n"
+        '1. "required_years": the minimum years of professional experience '
+        "it asks for, as a number (e.g. 3). If none is stated, use null.\n"
+        '2. "related_professions": a list of 4-8 job titles/professions that '
+        "are close enough to this role that someone with that title would be "
+        "a reasonable fit for it (e.g. for a Machine Learning Engineer JD: "
+        '["Machine Learning Engineer", "AI Engineer", "Data Scientist", '
+        '"Applied Scientist", "Software Engineer - ML", "Research Engineer"]). '
+        "Base this on the actual responsibilities/skills in the JD, not just "
+        "its title.\n\n"
+        f"Reply with ONLY a JSON object like "
+        '{"required_years": 3, "related_professions": ["...", "..."]}'
+        f".\n\nJob description:\n{jd_text[:4000]}"
+    )
+    try:
+        response = httpx.post(
+            GEMINI_URL,
+            params={"key": settings.gemini_api_key},
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=20,
+        )
+        response.raise_for_status()
+        data = response.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except httpx.HTTPStatusError as e:
+        print(f"[JobAgent] gemini_filler: HTTP {e.response.status_code} extracting JD requirements: {e.response.text[:300]}", flush=True)
+        return None
+    except Exception as e:
+        print(f"[JobAgent] gemini_filler: JD requirements extraction failed: {e}", flush=True)
+        return None
+
+    match = _JSON_BLOCK_RE.search(text)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return None
+
+    required_years = parsed.get("required_years")
+    try:
+        required_years = float(required_years) if required_years is not None else None
+    except (TypeError, ValueError):
+        required_years = None
+
+    related_professions = parsed.get("related_professions")
+    if not isinstance(related_professions, list):
+        related_professions = []
+    related_professions = [str(p).strip() for p in related_professions if str(p).strip()]
+
+    return {"required_years": required_years, "related_professions": related_professions}
