@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from app.routers import (
     documents,
@@ -38,3 +39,9 @@ app.include_router(referrals.router)
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# Serves the static dashboard (frontend/) at the API's own root, so the whole
+# app is reachable from one public URL instead of needing a separate static
+# host - the dashboard calls back into this same server's API routes above.
+app.mount("/", StaticFiles(directory="../frontend", html=True), name="frontend")
