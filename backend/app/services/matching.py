@@ -352,7 +352,10 @@ def match_all_unmatched_jobs_for_user(db: Session, user: User) -> list[Applicati
     # Runs before the cross-encoder stage below since it's far cheaper and
     # should cut the candidate pool down first, per the matching design.
     screened_candidates_by_job: dict = {}
-    for job_posting, resume_options in candidates_by_job.items():
+    for job_posting in jobs:
+        resume_options = candidates_by_job.get(job_posting.id)
+        if not resume_options:
+            continue
         jd_text = jd_text_by_job_id[job_posting.id]
         screened = []
         for resume in resume_options:
